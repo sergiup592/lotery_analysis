@@ -32,7 +32,7 @@ git clone https://github.com/yourusername/lottery-number-generator.git
 cd lottery-number-generator
 ```
 
-Ensure you have the `training.txt` file with historical lottery data in the same directory. Each line in the file should represent a set of lottery numbers without delimiters.
+Ensure you have the `past_loterry_numbers.txt` file with historical lottery data in the same directory. Each line in the file should represent a set of lottery numbers without delimiters.
 
 ## Usage
 
