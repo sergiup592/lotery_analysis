@@ -94,7 +94,3 @@ Generates new sets of lottery numbers based on the estimated probabilities.
 **Returns:**
 
 - `np.array`: A 2D array where each row is a generated set of lottery numbers.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
