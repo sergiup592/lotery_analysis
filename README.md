@@ -47,7 +47,7 @@ The generated lottery numbers will be saved in a file named `generated_data.txt`
 ## File Descriptions
 
 - `generate_lottery_numbers.py`: Main script that reads the data, estimates probabilities, and generates new lottery numbers.
-- `training.txt`: Input file containing historical lottery data.
+- `past_loterry_numbers.txt`: Input file containing historical lottery data.
 
 ## Functions
 
