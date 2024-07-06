@@ -86,7 +86,7 @@ def generate_lists(n, main_unique_numbers, main_estimated_probabilities, bonus_u
 
 if __name__ == '__main__':
     numbers_of_lists_to_generate = 1726  # Number of sets of lottery numbers to generate
-    data = read_data("training.txt")
+    data = read_data("past_loterry_numbers.txt")
     
     # Calculate the number of years and days for each entry based on the assumption of two draws per week
     num_entries = len(data)
