@@ -1,96 +1,150 @@
+# Lottery Number Analysis System
 
-# Lottery Number Generator
+## Overview
+A Python-based lottery number analysis system that provides tools for analyzing historical lottery data and generating number combinations. This system includes pattern analysis, probability estimation, and comprehensive statistical reporting capabilities.
 
-This project is designed to read historical lottery data, estimate the probabilities of drawing certain numbers using hierarchical Bayesian methods, and generate new sets of lottery numbers based on these estimated probabilities. The hierarchical probabilities consider time decay, giving more weight to recent data.
+**Important Disclaimer:** This system is for academic and entertainment purposes only. It cannot predict lottery numbers or increase chances of winning. All lottery draws are completely random and independent events.
 
-## Table of Contents
+## Features
+- Historical data analysis
+- Pattern recognition and analysis
+- Probability estimation
+- Number generation with configurable constraints
+- Statistical analysis and reporting
+- Caching system for performance optimization
+- Comprehensive validation checks
+- Detailed result analysis with confidence intervals
 
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Usage](#usage)
-- [File Descriptions](#file-descriptions)
-- [Functions](#functions)
-- [License](#license)
-
-## Prerequisites
-
-- Python 3.x
-- Required Python libraries: numpy, scipy
-
-You can install the necessary libraries using pip:
-
-```bash
-pip install numpy scipy
-```
+## Requirements
+- Python 3.7+
+- Required packages:
+  - numpy
+  - scipy
+  - scikit-learn
+  - joblib
+  - logging
+  - typing
+  - dataclasses
+  - collections
 
 ## Installation
-
-Clone the repository:
-
+1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/lottery-number-generator.git
-cd lottery-number-generator
+git clone [repository-url]
 ```
 
-Ensure you have the `past_loterry_numbers.txt` file with historical lottery data in the same directory. Each line in the file should represent a set of lottery numbers without delimiters.
+2. Install required packages:
+```bash
+pip install numpy scipy scikit-learn joblib
+```
 
 ## Usage
 
-Run the script to generate lottery numbers:
-
+### Command Line Interface
 ```bash
-python generate_lottery_numbers.py
+python lottery_system.py --input lottery_numbers.txt --output analysis.txt --draws 3
 ```
 
-The generated lottery numbers will be saved in a file named `generated_data.txt`.
+Arguments:
+- `--input`: Path to input file containing historical lottery data
+- `--output`: Path for output analysis file (default: lottery_analysis.txt)
+- `--draws`: Number of draws to generate (default: 3)
+- `--cache`: Cache file location (default: pattern_cache.joblib)
 
-## File Descriptions
+### Python API
+```python
+from lottery_system import LotteryConfig, DataManager, PatternAnalyzer, ProbabilityEstimator, NumberGenerator, ResultAnalyzer
 
-- `generate_lottery_numbers.py`: Main script that reads the data, estimates probabilities, and generates new lottery numbers.
-- `past_loterry_numbers.txt`: Input file containing historical lottery data.
+# Initialize components
+config = LotteryConfig()
+data_manager = DataManager(config)
+pattern_analyzer = PatternAnalyzer(config)
+probability_estimator = ProbabilityEstimator(config, pattern_analyzer)
+number_generator = NumberGenerator(config, pattern_analyzer)
+result_analyzer = ResultAnalyzer(config)
 
-## Functions
+# Load and analyze data
+data = data_manager.load_data('lottery_numbers.txt')
+main_numbers = data_manager.get_main_numbers()
+bonus_numbers = data_manager.get_bonus_numbers()
 
-### `read_data(file_path)`
+# Generate numbers
+main_probs = probability_estimator.estimate_probabilities(main_numbers)
+bonus_probs = probability_estimator.estimate_probabilities(bonus_numbers, is_bonus=True)
+generated_numbers = number_generator.generate_numbers(3, main_probs, bonus_probs, historical_data=data)
 
-Reads the lottery data from the file and structures it into a 2D numpy array.
+# Analyze results
+stats = result_analyzer.calculate_statistics(generated_numbers)
+result_analyzer.save_analysis('analysis.txt', generated_numbers, stats)
+```
 
-**Parameters:**
+## Configuration
+The system can be configured using the `LotteryConfig` class:
 
-- `file_path` (str): Path to the file containing lottery data.
+```python
+config = LotteryConfig(
+    n_main=5,                  # Number of main numbers in each draw
+    n_bonus=2,                 # Number of bonus numbers in each draw
+    main_number_range=50,      # Range for main numbers
+    bonus_number_range=12,     # Range for bonus numbers
+    base_alpha=1.0,           # Base concentration parameter
+    time_decay_factor=0.95,   # Time decay factor for historical data
+    cache_size=1000,          # Maximum cache size
+    default_window_size=10,   # Default analysis window size
+    cv_splits=5,              # Cross-validation splits
+    random_state=42           # Random seed for reproducibility
+)
+```
 
-**Returns:**
+## Input File Format
+The input file should contain lottery numbers in plain text format:
+- One number per line
+- Numbers for each draw should be in sequence
+- Main numbers followed by bonus numbers
+- Example:
+```
+7
+12
+23
+31
+45
+3
+8
+```
 
-- `np.array`: A 2D numpy array where each row represents a set of lottery numbers.
+## Output Analysis
+The system generates a comprehensive analysis report including:
+- Generated number combinations
+- Pattern analysis
+- Confidence intervals
+- Number balance metrics
+- Temporal analysis
+- Frequency analysis for main and bonus numbers
 
-### `estimate_hierarchical_probabilities(numbers, alpha=1, years=None, days=None, time_decay_factor=0.9)`
+## Error Handling
+The system includes comprehensive error handling and validation:
+- Input data validation
+- Configuration validation
+- Runtime error handling
+- Detailed logging
 
-Estimates the probabilities of drawing certain numbers using a hierarchical Bayesian method.
+## Caching
+The system implements caching for performance optimization:
+- Pattern analysis results
+- Probability calculations
+- Analysis results
 
-**Parameters:**
+## Contributing
+Contributions are welcome! Please feel free to submit pull requests.
 
-- `numbers` (np.array): Flattened array of lottery numbers.
-- `alpha` (float): Dirichlet prior parameter.
-- `years` (np.array): Array representing the year of each draw.
-- `days` (np.array): Array representing the day (or period) of each draw.
-- `time_decay_factor` (float): Factor to apply exponential decay to past data.
+## License
+[Insert appropriate license information]
 
-**Returns:**
+## Disclaimer
+This system is designed for academic and entertainment purposes only. It cannot predict lottery numbers or increase the probability of winning. Lottery games are based on random chance, and no analysis system can predict future draws. Please gamble responsibly.
 
-- `tuple`: Unique numbers and their estimated probabilities.
+## Author
+[Insert author information]
 
-### `generate_lists(n, main_unique_numbers, main_estimated_probabilities, bonus_unique_numbers, bonus_estimated_probabilities)`
-
-Generates new sets of lottery numbers based on the estimated probabilities.
-
-**Parameters:**
-
-- `n` (int): Number of sets of lottery numbers to generate.
-- `main_unique_numbers` (np.array): Unique main lottery numbers.
-- `main_estimated_probabilities` (np.array): Estimated probabilities of main lottery numbers.
-- `bonus_unique_numbers` (np.array): Unique bonus lottery numbers.
-- `bonus_estimated_probabilities` (np.array): Estimated probabilities of bonus lottery numbers.
-
-**Returns:**
-
-- `np.array`: A 2D array where each row is a generated set of lottery numbers.
+## Support
+For questions and support, please [create an issue](link-to-issues) in the repository.
