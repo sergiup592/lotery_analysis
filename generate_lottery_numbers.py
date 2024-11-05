@@ -1879,4 +1879,4 @@ def run_from_command_line():
 if __name__ == '__main__':
     run_from_command_line()
 
-# python lottery_system.py --input lottery_numbers.txt --output analysis.txt --draws 3
+# python generate_lottery_numbers.py --input lottery_numbers.txt --output analysis.txt --draws 3
