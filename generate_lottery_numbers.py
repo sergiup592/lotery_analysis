@@ -471,6 +471,7 @@ class NumberGenerator(ValidationMixin):
         self.max_attempts = 500
         self.target_spacing = 8.5
         self.spacing_tolerance = 2.0
+        self.range_segments = 5
         self.logger = logging.getLogger(__name__)
 
     def _validate_draw(self, draw: np.ndarray, historical_data: Optional[np.ndarray] = None) -> bool:
@@ -937,25 +938,99 @@ class NumberGenerator(ValidationMixin):
         return None
     
     def _evaluate_main_numbers(self, numbers: np.ndarray,
-                             historical_data: Optional[np.ndarray],
-                             previous_draws: set) -> float:
-        """Evaluate main numbers using shared analytics"""
+                         historical_data: Optional[np.ndarray],
+                         previous_draws: set) -> float:
+        """Enhanced evaluation with historical pattern analysis and draw history"""
         try:
+            # Get base metrics
             metrics = self.analytics.calculate_pattern_metrics(numbers, historical_data)
             spacing_metrics = self.analytics.calculate_spacing_metrics(numbers)
             balance_metrics = self.analytics.calculate_balance_metrics(
                 numbers, self.config.main_number_range
             )
             
+            # Calculate range coverage
+            segment_size = self.config.main_number_range // self.range_segments
+            segments_used = set()
+            for num in numbers:
+                segment = (num - 1) // segment_size
+                if segment < self.range_segments:
+                    segments_used.add(segment)
+            
+            range_coverage = len(segments_used) / self.range_segments
+            
+            # Calculate spacing quality
+            sorted_nums = np.sort(numbers)
+            spacings = np.diff(sorted_nums)
+            spacing_quality = 1.0 - np.std(spacings) / (np.mean(spacings) + 1e-10)
+            
+            # Calculate distribution score
+            distribution_score = 1.0 - abs(balance_metrics['low_high_ratio'] - 0.5)
+            
+            previous_draw_penalty = 0
+            recent_draw_weight = 1.0
+            if previous_draws:
+                recent_draws = sorted(previous_draws, reverse=True)[:5]
+                for draw in recent_draws:
+                    main_numbers = draw[:self.config.n_main]
+                    # Check for common numbers
+                    common_numbers = set(numbers).intersection(set(main_numbers))
+                    # Penalize based on number of common numbers, weighted by recency
+                    previous_draw_penalty += len(common_numbers) * 0.1 * recent_draw_weight
+                    recent_draw_weight *= 0.8 
+            
+            historical_pattern_score = 0.5
+            if historical_data is not None:
+                try:
+                    historical_gaps = []
+                    for draw in historical_data[-50:]:
+                        main_nums = np.sort(draw[:self.config.n_main])
+                        historical_gaps.extend(np.diff(main_nums))
+                    
+                    # Compare current gaps with historical gaps
+                    current_gaps = np.diff(sorted_nums)
+                    hist_gap_mean = np.mean(historical_gaps)
+                    hist_gap_std = np.std(historical_gaps)
+                    
+                    # Score based on how well gaps match historical patterns
+                    gap_scores = []
+                    for gap in current_gaps:
+                        z_score = abs(gap - hist_gap_mean) / (hist_gap_std + 1e-10)
+                        gap_scores.append(np.exp(-z_score))
+                    historical_pattern_score = np.mean(gap_scores)
+                    
+                    # Analyze frequency patterns
+                    historical_freqs = np.bincount(
+                        historical_data[:, :self.config.n_main].flatten(),
+                        minlength=self.config.main_number_range + 1
+                    )[1:]
+                    historical_freqs = historical_freqs / np.sum(historical_freqs)
+                    
+                    # Check if less frequent numbers are included
+                    selected_freqs = historical_freqs[numbers - 1]
+                    freq_variety_score = 1 - np.std(selected_freqs) / (np.mean(selected_freqs) + 1e-10)
+                    
+                    historical_pattern_score = 0.6 * historical_pattern_score + 0.4 * freq_variety_score
+                    
+                except Exception as e:
+                    self.logger.warning(f"Historical pattern analysis failed: {str(e)}")
+            
             # Combine scores with weights
             score = (
-                0.3 * (1 - metrics['pattern_similarity']) +  # Prefer some novelty
-                0.3 * spacing_metrics['spacing_consistency'] +
-                0.2 * (1 - abs(balance_metrics['even_odd_ratio'] - 0.5)) +
-                0.2 * (1 - abs(balance_metrics['low_high_ratio'] - 0.5))
+                0.20 * (1 - metrics['pattern_similarity']) +
+                0.15 * spacing_metrics['spacing_consistency'] +
+                0.15 * (1 - abs(balance_metrics['even_odd_ratio'] - 0.5)) +
+                0.15 * distribution_score +
+                0.15 * range_coverage +
+                0.10 * spacing_quality +
+                0.10 * historical_pattern_score
             )
             
-            return score
+            # Apply previous draw penalty
+            score = score * (1 - previous_draw_penalty)
+            
+            return max(0.0, min(1.0, score))
+            
         except Exception as e:
             self.logger.warning(f"Main number evaluation failed: {str(e)}")
             return 0.0
@@ -964,26 +1039,83 @@ class NumberGenerator(ValidationMixin):
                           main_numbers: np.ndarray,
                           historical_data: Optional[np.ndarray],
                           previous_draws: set) -> float:
-        """Evaluate bonus numbers with maximum randomness"""
+        """Enhanced bonus number evaluation with historical analysis"""
         try:
-            # Start with a completely random base score
-            score = np.random.uniform(0.0, 1.0)
+            # Start with base randomness score
+            score = np.random.uniform(0.4, 0.6)  # Narrowed range for more controlled randomness
             
-            # Check minimum distance from main numbers
+            # Check distance from main numbers
             min_distance = float('inf')
             for bonus_num in numbers:
                 distances = np.abs(bonus_num - main_numbers)
                 min_dist = np.min(distances)
                 min_distance = min(min_distance, min_dist)
-                
-            # Only apply a small penalty if numbers are too close
-            if min_distance < 2:
-                score *= 0.9
-                
-            # Add small random variations
-            score += np.random.uniform(-0.1, 0.1)
             
-            return max(0.0, min(1.0, score))
+            # Distance score
+            distance_score = min(1.0, min_distance / 3)  # Normalize distance up to 3
+            
+            # New: Analyze previous draws
+            previous_draw_penalty = 0
+            if previous_draws:
+                recent_draws = sorted(previous_draws, reverse=True)[:3]  # Look at last 3 draws
+                recent_bonus_numbers = set()
+                for draw in recent_draws:
+                    bonus_numbers = draw[self.config.n_main:]
+                    recent_bonus_numbers.update(bonus_numbers)
+                
+                # Penalize for recently used bonus numbers
+                common_recent = set(numbers).intersection(recent_bonus_numbers)
+                previous_draw_penalty = len(common_recent) * 0.15
+            
+            # New: Historical pattern analysis
+            historical_score = 0.5  # Default score
+            if historical_data is not None:
+                try:
+                    # Analyze historical bonus number frequencies
+                    historical_bonus = historical_data[:, self.config.n_main:]
+                    bonus_freqs = np.bincount(
+                        historical_bonus.flatten(),
+                        minlength=self.config.bonus_number_range + 1
+                    )[1:]
+                    bonus_freqs = bonus_freqs / np.sum(bonus_freqs)
+                    
+                    # Calculate variety score based on historical frequencies
+                    selected_freqs = bonus_freqs[numbers - 1]
+                    freq_variety_score = 1 - np.std(selected_freqs) / (np.mean(selected_freqs) + 1e-10)
+                    
+                    # Analyze common bonus number combinations
+                    combo_count = 0
+                    for hist_draw in historical_data[-50:]:  # Look at last 50 draws
+                        hist_bonus = set(hist_draw[self.config.n_main:])
+                        if set(numbers).issubset(hist_bonus):
+                            combo_count += 1
+                    
+                    combination_novelty = 1 - (combo_count / 50)  # Prefer less common combinations
+                    
+                    historical_score = 0.6 * freq_variety_score + 0.4 * combination_novelty
+                    
+                except Exception as e:
+                    self.logger.warning(f"Historical bonus pattern analysis failed: {str(e)}")
+            
+            # Calculate range coverage for bonus numbers
+            segment_size = self.config.bonus_number_range // 3  # Divide bonus range into thirds
+            segments_used = set()
+            for num in numbers:
+                segment = (num - 1) // segment_size
+                if segment < 3:
+                    segments_used.add(segment)
+            range_coverage = len(segments_used) / 3
+            
+            # Combine all scores
+            final_score = (
+                0.25 * score +               # Base randomness
+                0.20 * distance_score +      # Distance from main numbers
+                0.20 * historical_score +    # Historical patterns
+                0.20 * range_coverage +      # Range coverage
+                0.15 * (1 - previous_draw_penalty)  # Previous draw penalty
+            )
+            
+            return max(0.0, min(1.0, final_score))
             
         except Exception as e:
             self.logger.warning(f"Bonus number evaluation failed: {str(e)}")
@@ -1726,15 +1858,6 @@ class ResultAnalyzer:
         except Exception as e:
             self.logger.error(f"Failed to save analysis: {str(e)}")
             return False
-    
-    def load_analysis(self, filename: str) -> Optional[str]:
-        """Load previous analysis results"""
-        try:
-            with open(filename, 'r') as f:
-                return f.read()
-        except Exception as e:
-            self.logger.error(f"Failed to load analysis: {str(e)}")
-            return None
 
 # Optional utility functions for command-line usage
 def parse_arguments():
@@ -1906,4 +2029,4 @@ def run_from_command_line():
 if __name__ == '__main__':
     run_from_command_line()
 
-# python generate_lottery_numbers.py --input lottery_numbers.txt --output analysis.txt --draws 3
+# python3 generate_lottery_numbers.py --input lottery_numbers.txt --output analysis.txt --draws 3
