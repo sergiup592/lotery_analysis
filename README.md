@@ -3,8 +3,6 @@
 ## Overview
 A Python-based lottery number analysis system that provides tools for analyzing historical lottery data and generating number combinations. This system includes pattern analysis, probability estimation, and comprehensive statistical reporting capabilities.
 
-**Important Disclaimer:** This system is for academic and entertainment purposes only. It cannot predict lottery numbers or increase chances of winning. All lottery draws are completely random and independent events.
-
 ## Features
 - Historical data analysis
 - Pattern recognition and analysis
