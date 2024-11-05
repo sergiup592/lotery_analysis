@@ -835,70 +835,102 @@ class NumberGenerator(ValidationMixin):
             return probabilities / np.sum(probabilities)
     
     def _adjust_bonus_probabilities(self, probabilities: np.ndarray,
-                                  main_numbers: np.ndarray,
-                                  previous_draws: set = None) -> np.ndarray:
-        """More lenient bonus probability adjustment"""
+                              main_numbers: np.ndarray,
+                              previous_draws: set = None) -> np.ndarray:
+        """Balanced bonus probability adjustment"""
         try:
             adjusted_probs = probabilities.copy()
-            number_range = len(probabilities)
+            number_range = len(adjusted_probs)
             
-            # Add minimum probability
-            min_prob = 0.05 / number_range
-            adjusted_probs += min_prob
+            # Start by equalizing probabilities across the range
+            adjusted_probs = np.ones_like(adjusted_probs) / number_range
             
-            # Reduce probabilities near main numbers - more gradual reduction
+            # Add random noise that varies by range to prevent favoring lower numbers
+            ranges = np.array_split(np.arange(number_range), 3)  # Split into 3 ranges
+            for range_slice in ranges:
+                noise = np.random.uniform(0.7, 1.3, size=len(range_slice))  # Similar noise across ranges
+                adjusted_probs[range_slice] *= noise
+            
+            # Zero out main numbers
             for main_num in main_numbers:
-                for i in range(len(adjusted_probs)):
-                    num = i + 1
-                    distance = abs(num - main_num)
-                    if distance < 3:
-                        adjusted_probs[i] *= 0.7
+                if 0 <= main_num-1 < len(adjusted_probs):
+                    adjusted_probs[main_num-1] = 0
             
-            # Reduce probabilities of recent bonus numbers - more gradual
+            # Reduce probability of recently used bonus numbers
             if previous_draws:
-                recent_bonus = set()
+                recent_bonus_numbers = set()
                 for draw in list(previous_draws)[-3:]:
-                    recent_bonus.update(draw[self.config.n_main:])
-                for num in recent_bonus:
+                    recent_bonus = draw[self.config.n_main:]
+                    recent_bonus_numbers.update(recent_bonus)
+                
+                for num in recent_bonus_numbers:
                     if 0 <= num-1 < len(adjusted_probs):
-                        adjusted_probs[num-1] *= 0.5
+                        adjusted_probs[num-1] *= 0.3
             
-            # Boost underutilized ranges - more moderate boost
-            quartiles = np.array_split(np.arange(number_range), 4)
-            for quartile in quartiles:
-                quartile_mean = np.mean(adjusted_probs[quartile])
-                if quartile_mean < np.mean(adjusted_probs) * 0.8:
-                    adjusted_probs[quartile] *= 1.2
+            # Ensure no range is completely zeroed out
+            for range_slice in ranges:
+                if np.all(adjusted_probs[range_slice] == 0):
+                    adjusted_probs[range_slice] = np.random.uniform(0, 0.1, size=len(range_slice))
             
-            return adjusted_probs / np.sum(adjusted_probs)
-            
+            # Normalize
+            if np.sum(adjusted_probs) > 0:
+                return adjusted_probs / np.sum(adjusted_probs)
+            else:
+                return np.ones_like(adjusted_probs) / len(adjusted_probs)
+                
         except Exception as e:
             self.logger.warning(f"Probability adjustment failed: {str(e)}")
             return probabilities / np.sum(probabilities)
-    
+        
     def _sample_unique_numbers(self, probabilities: np.ndarray,
-                             n_numbers: int, number_range: int) -> Optional[np.ndarray]:
-        """Sample unique numbers using rejection sampling"""
+                         n_numbers: int, number_range: int) -> Optional[np.ndarray]:
+        """Modified sampling method with improved distribution for bonus numbers"""
         max_retries = 50
         retries = 0
         
         while retries < max_retries:
-            sample_size = min(n_numbers * 2, number_range)
-            numbers = np.random.choice(
-                np.arange(1, number_range + 1),
-                size=sample_size,
-                p=probabilities,
-                replace=False
-            )
-            
-            unique_numbers = np.unique(numbers)
-            if len(unique_numbers) >= n_numbers:
-                selected_indices = np.random.choice(
-                    len(unique_numbers),
-                    size=n_numbers,
+            # For bonus numbers, use a stratified sampling approach
+            if n_numbers == self.config.n_bonus:
+                # Split the range into regions
+                regions = np.array_split(np.arange(1, number_range + 1), 4)
+                selected = []
+                
+                # Try to pick numbers from different regions
+                remaining_regions = list(range(len(regions)))
+                while len(selected) < n_numbers and remaining_regions:
+                    region_idx = np.random.choice(remaining_regions)
+                    region = regions[region_idx]
+                    
+                    # Get region-specific probabilities
+                    region_probs = probabilities[region[0]-1:region[-1]]
+                    region_probs = region_probs / np.sum(region_probs)
+                    
+                    # Sample from region
+                    number = np.random.choice(region, p=region_probs)
+                    if number not in selected:
+                        selected.append(number)
+                        remaining_regions.remove(region_idx)
+                
+                if len(selected) == n_numbers:
+                    return np.sort(selected)
+            else:
+                # Original sampling for main numbers
+                sample_size = min(n_numbers * 2, number_range)
+                numbers = np.random.choice(
+                    np.arange(1, number_range + 1),
+                    size=sample_size,
+                    p=probabilities,
                     replace=False
                 )
-                return np.sort(unique_numbers[selected_indices])
+                
+                unique_numbers = np.unique(numbers)
+                if len(unique_numbers) >= n_numbers:
+                    selected_indices = np.random.choice(
+                        len(unique_numbers),
+                        size=n_numbers,
+                        replace=False
+                    )
+                    return np.sort(unique_numbers[selected_indices])
             
             retries += 1
         
@@ -929,35 +961,30 @@ class NumberGenerator(ValidationMixin):
             return 0.0
     
     def _evaluate_bonus_numbers(self, numbers: np.ndarray,
-                              main_numbers: np.ndarray,
-                              historical_data: Optional[np.ndarray],
-                              previous_draws: set) -> float:
-        """Evaluate bonus numbers using shared analytics"""
+                          main_numbers: np.ndarray,
+                          historical_data: Optional[np.ndarray],
+                          previous_draws: set) -> float:
+        """Evaluate bonus numbers with maximum randomness"""
         try:
-            metrics = self.analytics.calculate_pattern_metrics(numbers, historical_data)
-            spacing_metrics = self.analytics.calculate_spacing_metrics(numbers)
-            balance_metrics = self.analytics.calculate_balance_metrics(
-                numbers, self.config.bonus_number_range
-            )
+            # Start with a completely random base score
+            score = np.random.uniform(0.0, 1.0)
             
-            # Calculate interaction with main numbers
+            # Check minimum distance from main numbers
             min_distance = float('inf')
             for bonus_num in numbers:
                 distances = np.abs(bonus_num - main_numbers)
                 min_dist = np.min(distances)
                 min_distance = min(min_distance, min_dist)
+                
+            # Only apply a small penalty if numbers are too close
+            if min_distance < 2:
+                score *= 0.9
+                
+            # Add small random variations
+            score += np.random.uniform(-0.1, 0.1)
             
-            interaction_score = min_distance / self.config.bonus_number_range
+            return max(0.0, min(1.0, score))
             
-            # Combine scores with weights
-            score = (
-                0.3 * interaction_score +
-                0.3 * spacing_metrics['spacing_consistency'] +
-                0.2 * (1 - metrics['pattern_similarity']) +
-                0.2 * balance_metrics['low_high_ratio']
-            )
-            
-            return score
         except Exception as e:
             self.logger.warning(f"Bonus number evaluation failed: {str(e)}")
             return 0.0
