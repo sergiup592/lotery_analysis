@@ -82,9 +82,15 @@ class TransformerBlock(tf.keras.layers.Layer):
     """
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
         super(TransformerBlock, self).__init__()
+        # Store params as instance variables
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.ff_dim = ff_dim
+        self.rate = rate
+        
         self.att = MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
         self.ffn = tf.keras.Sequential([
-            Dense(ff_dim, activation="gelu"),  # Using GELU instead of ReLU
+            Dense(ff_dim, activation="gelu"),
             Dropout(rate),
             Dense(embed_dim),
         ])
@@ -96,7 +102,18 @@ class TransformerBlock(tf.keras.layers.Layer):
         # Dropouts
         self.dropout1 = Dropout(rate)
         self.dropout2 = Dropout(rate)
-        
+    
+    # Add get_config method
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "embed_dim": self.embed_dim,
+            "num_heads": self.num_heads,
+            "ff_dim": self.ff_dim,
+            "rate": self.rate
+        })
+        return config
+    
     def call(self, inputs, training=True):
         # Attention mechanism
         attn_output = self.att(inputs, inputs)
@@ -1000,7 +1017,7 @@ class EnhancedLotteryPredictor:
 
     def hyperparameter_search(self, main_numbers, bonus_numbers, trials=10):
         """
-        Perform hyperparameter search to find optimal model parameters
+        Perform hyperparameter search to find optimal model parameters with improved error handling
         
         Args:
             main_numbers: List of main lottery numbers
@@ -1024,6 +1041,15 @@ class EnhancedLotteryPredictor:
         best_score = -np.inf
         best_params = {}
         
+        # Default fallback parameters in case all trials fail
+        fallback_params = {
+            'sequence_length': 15,
+            'embed_dim': 32,
+            'num_heads': 4,
+            'ff_dim': 64,
+            'num_transformer_blocks': 2
+        }
+        
         # Store original parameters to restore later
         original_params = {
             'sequence_length': self.sequence_length,
@@ -1032,6 +1058,8 @@ class EnhancedLotteryPredictor:
             'ff_dim': self.ff_dim,
             'num_transformer_blocks': self.num_transformer_blocks
         }
+        
+        successful_trials = 0
         
         # Run trials
         for trial in range(trials):
@@ -1053,38 +1081,58 @@ class EnhancedLotteryPredictor:
                 setattr(self, param, value)
             
             # Prepare data with these parameters
-            prepared_data = self.prepare_data(main_numbers, bonus_numbers)
-            
-            if prepared_data:
-                # Train mini-models with fewer epochs for speed
-                try:
-                    mini_history = self.train_models(
-                        prepared_data, 
-                        epochs=30,  # Fewer epochs for search
-                        batch_size=16,
-                        patience=10
-                    )
-                    
-                    # Evaluate using validation loss as score
-                    main_val_loss = min(mini_history['main'].history['val_loss'])
-                    bonus_val_loss = min(mini_history['bonus'].history['val_loss'])
-                    
-                    # Combined score (weighted average)
-                    score = -(main_val_loss * 0.6 + bonus_val_loss * 0.4)  # Negative because lower loss is better
-                    
-                    logger.info(f"Trial score: {score}")
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_params = params.copy()
-                        logger.info(f"New best parameters found: {best_params}, score: {score}")
-                except Exception as e:
-                    logger.error(f"Error during trial: {e}")
-                    logger.error(traceback.format_exc())
+            try:
+                prepared_data = self.prepare_data(main_numbers, bonus_numbers)
+                
+                if prepared_data:
+                    # Train mini-models with fewer epochs for speed
+                    try:
+                        mini_history = self.train_models(
+                            prepared_data, 
+                            epochs=30,  # Fewer epochs for search
+                            batch_size=16,
+                            patience=10
+                        )
+                        
+                        # Check if history contains required keys
+                        if (mini_history and 'main' in mini_history and 'bonus' in mini_history and
+                            'val_loss' in mini_history['main'].history and 
+                            'val_loss' in mini_history['bonus'].history):
+                            
+                            # Evaluate using validation loss as score
+                            main_val_loss = min(mini_history['main'].history['val_loss'])
+                            bonus_val_loss = min(mini_history['bonus'].history['val_loss'])
+                            
+                            # Combined score (weighted average)
+                            score = -(main_val_loss * 0.6 + bonus_val_loss * 0.4)  # Negative because lower loss is better
+                            
+                            logger.info(f"Trial score: {score}")
+                            successful_trials += 1
+                            
+                            if score > best_score:
+                                best_score = score
+                                best_params = params.copy()
+                                logger.info(f"New best parameters found: {best_params}, score: {score}")
+                        else:
+                            logger.warning(f"Trial {trial+1} did not produce valid history data")
+                    except Exception as e:
+                        logger.error(f"Error during trial training: {e}")
+                        logger.error(traceback.format_exc())
+                else:
+                    logger.warning(f"Trial {trial+1} failed to prepare data")
+            except Exception as e:
+                logger.error(f"Error during trial data preparation: {e}")
+                logger.error(traceback.format_exc())
         
         # Restore original parameters
         for param, value in original_params.items():
             setattr(self, param, value)
+        
+        # If no successful trials, use fallback parameters
+        if successful_trials == 0 or not best_params:
+            logger.warning("No successful trials completed. Using fallback parameters.")
+            best_params = fallback_params
+            best_score = 0  # Neutral score for fallback
         
         logger.info(f"Hyperparameter search complete. Best parameters: {best_params}")
         
@@ -1094,6 +1142,8 @@ class EnhancedLotteryPredictor:
                 json.dump({
                     'best_params': best_params,
                     'best_score': float(best_score),
+                    'successful_trials': successful_trials,
+                    'total_trials': trials,
                     'search_date': datetime.now().isoformat()
                 }, f, indent=2)
         except Exception as e:
@@ -1225,7 +1275,7 @@ class EnhancedLotteryPredictor:
 
     def _ensemble_predict(self, input_scaled, model, scaler_y, num_to_predict=5, is_bonus=False, num_simulations=1000):
         """
-        Improved prediction with ensemble approach, Monte Carlo dropout, and statistical combination
+        Improved prediction with ensemble approach, Monte Carlo dropout, and statistical combination - fixed to avoid retracing
         
         Args:
             input_scaled: Scaled input features
@@ -1242,8 +1292,8 @@ class EnhancedLotteryPredictor:
         min_num = self.bonus_min_number if is_bonus else self.main_min_number
         max_num = self.bonus_max_number if is_bonus else self.main_max_number
         
-        # Create a function that enables dropout during inference
-        @tf.function
+        # Create a function that enables dropout during inference - MOVED OUTSIDE LOOP
+        @tf.function(reduce_retracing=True)
         def predict_with_dropout(x, training=True):
             return model(x, training=training)
         
@@ -1310,7 +1360,7 @@ class EnhancedLotteryPredictor:
     
     def predict_with_ensemble(self, input_scaled, models, scaler_y, num_to_predict=5, is_bonus=False, num_simulations=500):
         """
-        Make predictions using an ensemble of models with Monte Carlo dropout
+        Make predictions using an ensemble of models with Monte Carlo dropout - improved to avoid tf.function retracing
         
         Args:
             input_scaled: Scaled input features
@@ -1333,6 +1383,11 @@ class EnhancedLotteryPredictor:
         # Different noise scales for various simulations
         noise_scales = np.linspace(0.01, 0.08, 5)
         
+        # Define prediction function with dropout OUTSIDE the loop - FIX FOR RETRACING ISSUE
+        @tf.function(reduce_retracing=True)
+        def predict_with_dropout(model, x, training=True):
+            return model(x, training=training)
+        
         # Make predictions with each model
         for model_idx, model in enumerate(models):
             logger.debug(f"Making predictions with {'bonus' if is_bonus else 'main'} model {model_idx+1}/{len(models)}")
@@ -1348,11 +1403,6 @@ class EnhancedLotteryPredictor:
             simulations_per_model = num_simulations // len(models)
             
             for _ in range(simulations_per_model):
-                # Define a function that enables dropout during inference
-                @tf.function
-                def predict_with_dropout(x, training=True):
-                    return model(x, training=training)
-                
                 # Pick a random noise scale
                 noise_scale = np.random.choice(noise_scales)
                 
@@ -1360,8 +1410,8 @@ class EnhancedLotteryPredictor:
                 noise = np.random.normal(0, noise_scale, input_scaled.shape)
                 noisy_input = input_scaled + noise
                 
-                # Predict with dropout enabled
-                mc_pred_scaled = predict_with_dropout(noisy_input, training=True).numpy()
+                # Predict with dropout enabled - using the function defined outside the loop
+                mc_pred_scaled = predict_with_dropout(model, noisy_input, training=True).numpy()
                 mc_pred = scaler_y.inverse_transform(mc_pred_scaled)[0][0]
                 mc_pred_round = int(round(mc_pred))
                 mc_pred_round = max(min_num, min(max_num, mc_pred_round))
