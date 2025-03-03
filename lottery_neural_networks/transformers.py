@@ -3,6 +3,7 @@
 python enhanced_transformer.py --file lottery_numbers.txt --predictions 20
 
 python enhanced_transformer.py --file lottery_numbers.txt --optimize --trials 30 --ensemble --num_models 7 --predictions 20
+
 """
 
 import os
@@ -35,6 +36,28 @@ from tensorflow.keras.regularizers import l1_l2
 import optuna
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
+
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Configure GPU memory growth to avoid taking all memory at once
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"Found {len(gpus)} GPU(s): {gpus}")
+        
+        # Instead of enabling global mixed precision,
+        # we'll use it selectively for compute-intensive layers
+        print("Using selective mixed precision for compute-intensive operations")
+    except RuntimeError as e:
+        print(f"GPU configuration error: {e}")
+else:
+    print("No GPU found. Using CPU.")
+
+# Define policies that will be used selectively
+COMPUTE_INTENSIVE_POLICY = tf.keras.mixed_precision.Policy('mixed_float16')
+NUMERICALLY_SENSITIVE_POLICY = tf.keras.mixed_precision.Policy('float32')
+
 
 # Set random seeds for reproducibility
 RANDOM_SEED = 42
@@ -901,48 +924,75 @@ class EnhancedFeatureEngineering:
 # IMPROVED TRANSFORMER MODEL COMPONENTS
 #######################
 
+# Here are the fixed implementations of the problematic classes:
+
 class ImprovedTransformerBlock(tf.keras.layers.Layer):
     """Advanced transformer block with improved architecture and residual connections."""
     
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
-        super(ImprovedTransformerBlock, self).__init__()
-        self.att = MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim//num_heads, dropout=rate*0.5)
+        super(ImprovedTransformerBlock, self).__init__(dtype=NUMERICALLY_SENSITIVE_POLICY)
+        
+        # Attention layers are numerically sensitive
+        self.att = MultiHeadAttention(
+            num_heads=num_heads, 
+            key_dim=embed_dim//num_heads, 
+            dropout=rate*0.5,
+            dtype=NUMERICALLY_SENSITIVE_POLICY
+        )
         
         # Two-layer feed-forward network with intermediate activation
         self.ffn = tf.keras.Sequential([
-            Dense(ff_dim, activation="gelu", kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4)),
-            BatchNormalization(),
+            Dense(ff_dim, activation="gelu", kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4),
+                 dtype=COMPUTE_INTENSIVE_POLICY),
+            BatchNormalization(dtype=NUMERICALLY_SENSITIVE_POLICY),  # Keep BN in float32
             Dropout(rate),
-            Dense(embed_dim, kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4)),
+            Dense(embed_dim, kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4),
+                 dtype=COMPUTE_INTENSIVE_POLICY),
         ])
         
-        # Pre-normalization layers (more stable for training)
-        self.layernorm1 = LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+        # Layer normalization is numerically sensitive, keep in float32
+        self.layernorm1 = LayerNormalization(epsilon=1e-4, dtype=NUMERICALLY_SENSITIVE_POLICY)
+        self.layernorm2 = LayerNormalization(epsilon=1e-4, dtype=NUMERICALLY_SENSITIVE_POLICY)
         self.dropout1 = Dropout(rate)
         self.dropout2 = Dropout(rate)
         
+        # Add Lambda layers for tensor operations
+        self.cast_to_float32 = tf.keras.layers.Lambda(lambda x: tf.cast(x, tf.float32))
+        self.add_layer = tf.keras.layers.Add()
+        
     def call(self, inputs, training=False):
+        # Use Lambda layer for casting to float32
+        inputs_float32 = self.cast_to_float32(inputs)
+        
         # Pre-norm architecture (more stable training)
-        attn_input = self.layernorm1(inputs)
+        attn_input = self.layernorm1(inputs_float32)
         attn_output = self.att(attn_input, attn_input)
         attn_output = self.dropout1(attn_output, training=training)
-        out1 = Add()([inputs, attn_output])  # Residual connection
+        
+        # Use Lambda for casting and Add for addition
+        out1_cast = self.cast_to_float32(inputs)  # Cast inputs to match attn_output
+        out1 = self.add_layer([out1_cast, attn_output])
         
         ffn_input = self.layernorm2(out1)
         ffn_output = self.ffn(ffn_input)
         ffn_output = self.dropout2(ffn_output, training=training)
-        return Add()([out1, ffn_output])  # Residual connection
+        
+        # Use Add layer for the residual connection
+        return self.add_layer([out1, ffn_output])
 
 class PositionalEncoding(tf.keras.layers.Layer):
     """Enhanced positional encoding layer with learnable parameters."""
     
     def __init__(self, position, d_model):
-        super(PositionalEncoding, self).__init__()
+        super(PositionalEncoding, self).__init__(dtype=NUMERICALLY_SENSITIVE_POLICY)
         self.pos_encoding = self.positional_encoding(position, d_model)
         
         # Add learnable scaling factor
         self.pos_scaling = tf.Variable(1.0, trainable=True, name="pos_encoding_scale")
+        
+        # Add layers for tensor operations
+        self.cast_to_float32 = tf.keras.layers.Lambda(lambda x: tf.cast(x, tf.float32))
+        self.add_layer = tf.keras.layers.Add()
         
     def get_angles(self, position, i, d_model):
         angles = 1 / tf.pow(10000, (2 * (i // 2)) / tf.cast(d_model, tf.float32))
@@ -965,26 +1015,55 @@ class PositionalEncoding(tf.keras.layers.Layer):
         return tf.cast(pos_encoding, tf.float32)
         
     def call(self, inputs):
-        return inputs + self.pos_scaling * self.pos_encoding[:, :tf.shape(inputs)[1], :]
+        # Cast inputs to float32 using a Lambda layer
+        inputs_float32 = self.cast_to_float32(inputs)
+        
+        # Get the sequence length from the dynamic shape
+        seq_len = tf.keras.layers.Lambda(lambda x: tf.shape(x)[1])(inputs_float32)
+        
+        # Create a Lambda layer to get the appropriate slice of positional encoding
+        pos_enc_slice = tf.keras.layers.Lambda(
+            lambda x: self.pos_scaling * self.pos_encoding[:, :x, :]
+        )(seq_len)
+        
+        # Use Add layer to combine inputs with positional encoding
+        return self.add_layer([inputs_float32, pos_enc_slice])
 
 class FeedForwardWithResidual(tf.keras.layers.Layer):
     """Feed-forward network with residual connection and layer normalization."""
     
     def __init__(self, dim, expansion_factor=4, dropout_rate=0.1, activation="gelu"):
         super(FeedForwardWithResidual, self).__init__()
-        self.norm = LayerNormalization(epsilon=1e-6)
-        self.expand = Dense(dim * expansion_factor, activation=activation)
+        # LayerNorm is numerically sensitive
+        self.norm = LayerNormalization(epsilon=1e-4, dtype=NUMERICALLY_SENSITIVE_POLICY)
+        
+        # Dense layers can use mixed precision
+        self.expand = Dense(
+            dim * expansion_factor, 
+            activation=activation,
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )
         self.dropout1 = Dropout(dropout_rate)
-        self.contract = Dense(dim)
+        self.contract = Dense(dim, dtype=COMPUTE_INTENSIVE_POLICY)
         self.dropout2 = Dropout(dropout_rate)
         
+        # Add Lambda and Add layers for tensor operations
+        self.cast_to_float32 = tf.keras.layers.Lambda(lambda x: tf.cast(x, tf.float32))
+        self.add_layer = tf.keras.layers.Add()
+        
     def call(self, inputs, training=False):
-        x = self.norm(inputs)
+        # Cast to float32 using a Lambda layer
+        inputs_float32 = self.cast_to_float32(inputs)
+        x = self.norm(inputs_float32)
+        
+        # Mixed precision for compute-intensive parts
         x = self.expand(x)
         x = self.dropout1(x, training=training)
         x = self.contract(x)
         x = self.dropout2(x, training=training)
-        return Add()([x, inputs])
+        
+        # Use Add layer for the residual connection
+        return self.add_layer([inputs, x])
 
 #######################
 # IMPROVED TRANSFORMER MODEL
@@ -1024,47 +1103,80 @@ class ImprovedTransformerModel:
         if params is not None:
             self.params.update(params)
     
+    # Here's how to modify the model building methods:
+
     def build_main_numbers_model(self):
-        """Build improved transformer model for main numbers prediction."""
+        """Build improved transformer model for main numbers prediction with selective precision."""
         # Input layers
         feature_input = Input(shape=(self.input_dim,), name="feature_input")
         sequence_input = Input(shape=(self.seq_length, 50), name="sequence_input")
         
-        # Process feature input with multi-layer network
-        x_features = Dense(self.params.get('embed_dim'), activation=self.params.get('activation'), 
-                          kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(feature_input)
+        # Process feature input with multi-layer network - compute intensive
+        x_features = Dense(
+            self.params.get('embed_dim'), 
+            activation=self.params.get('activation'), 
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(feature_input)
+        
         if self.params.get('use_batch_norm', True):
-            x_features = BatchNormalization()(x_features)
+            x_features = BatchNormalization(dtype=NUMERICALLY_SENSITIVE_POLICY)(x_features)
         x_features = Dropout(self.params.get('dropout_rate'))(x_features)
         
         # Add hidden layers for better feature processing
-        x_features = Dense(self.params.get('embed_dim'), activation=self.params.get('activation'), 
-                          kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(x_features)
+        x_features = Dense(
+            self.params.get('embed_dim'), 
+            activation=self.params.get('activation'), 
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(x_features)
+        
         if self.params.get('use_batch_norm', True):
-            x_features = BatchNormalization()(x_features)
+            x_features = BatchNormalization(dtype=NUMERICALLY_SENSITIVE_POLICY)(x_features)
         x_features = Dropout(self.params.get('dropout_rate'))(x_features)
         
         # Add final feature processing layer
-        x_features = Dense(self.params.get('embed_dim') // 2, activation=self.params.get('activation'), 
-                          kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(x_features)
+        x_features = Dense(
+            self.params.get('embed_dim') // 2, 
+            activation=self.params.get('activation'), 
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(x_features)
         
-        # Process sequence input with convolutional layer first
+        # Process sequence input with convolutional layer first - compute intensive
         if self.params.get('conv_filters', 0) > 0:
-            x_seq = Conv1D(self.params.get('conv_filters'), kernel_size=3, padding='same', 
-                         activation=self.params.get('activation'))(sequence_input)
+            x_seq = Conv1D(
+                self.params.get('conv_filters'), 
+                kernel_size=3, 
+                padding='same', 
+                activation=self.params.get('activation'),
+                dtype=COMPUTE_INTENSIVE_POLICY
+            )(sequence_input)
+            
             # Add a second convolutional layer for better pattern detection
-            x_seq = Conv1D(self.params.get('conv_filters'), kernel_size=5, padding='same', 
-                         activation=self.params.get('activation'))(x_seq)
+            x_seq = Conv1D(
+                self.params.get('conv_filters'), 
+                kernel_size=5, 
+                padding='same', 
+                activation=self.params.get('activation'),
+                dtype=COMPUTE_INTENSIVE_POLICY
+            )(x_seq)
         else:
             x_seq = sequence_input
             
         # Apply dense layer to match dimensions
-        x_seq = Dense(self.params.get('embed_dim'))(x_seq)
+        x_seq = Dense(
+            self.params.get('embed_dim'),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(x_seq)
         
-        # Apply positional encoding
-        x_seq = PositionalEncoding(self.seq_length, self.params.get('embed_dim'))(x_seq)
+        # Apply positional encoding - numerically sensitive
+        x_seq = PositionalEncoding(
+            self.seq_length, 
+            self.params.get('embed_dim')
+        )(x_seq)
         
-        # Stack advanced transformer blocks
+        # Stack advanced transformer blocks - mixed numerical sensitivity
         for _ in range(self.params.get('num_transformer_blocks', 3)):
             x_seq = ImprovedTransformerBlock(
                 self.params.get('embed_dim'), 
@@ -1075,47 +1187,83 @@ class ImprovedTransformerModel:
         
         # Use bidirectional GRU for better sequence modeling
         if self.params.get('use_gru', False):
-            # Bidirectional GRU for better sequence understanding
-            x_seq = Bidirectional(GRU(self.params.get('embed_dim') // 2, return_sequences=False))(x_seq)
+            # Optimize for GPU if available
+            if gpus:
+                # Use optimized GRU implementation - compute intensive
+                x_seq = Bidirectional(GRU(
+                    self.params.get('embed_dim') // 2, 
+                    return_sequences=False,
+                    recurrent_activation='sigmoid',  # Optimized for CuDNN
+                    reset_after=True,  # Required for CuDNN compatibility
+                    name='gpu_optimized_gru',
+                    dtype=COMPUTE_INTENSIVE_POLICY
+                ))(x_seq)
+            else:
+                # Standard GRU for CPU
+                x_seq = Bidirectional(GRU(
+                    self.params.get('embed_dim') // 2, 
+                    return_sequences=False,
+                    dtype=COMPUTE_INTENSIVE_POLICY
+                ))(x_seq)
         else:
             # Global attention pooling instead of simple average pooling
-            x_seq = Attention()([x_seq, x_seq])
+            # Attention is numerically sensitive
+            x_seq = Attention(dtype=NUMERICALLY_SENSITIVE_POLICY)([x_seq, x_seq])
             x_seq = GlobalAveragePooling1D()(x_seq)
         
         # Combine feature and sequence representations
         combined = Concatenate()([x_features, x_seq])
         
-        # Add multiple dense layers with residual connections
-        combined = Dense(self.params.get('ff_dim'), activation=self.params.get('activation'),
-                        kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(combined)
+        # Add multiple dense layers with residual connections - compute intensive
+        combined = Dense(
+            self.params.get('ff_dim'), 
+            activation=self.params.get('activation'),
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(combined)
+        
         if self.params.get('use_batch_norm', True):
-            combined = BatchNormalization()(combined)
+            combined = BatchNormalization(dtype=NUMERICALLY_SENSITIVE_POLICY)(combined)
         combined = Dropout(self.params.get('dropout_rate'))(combined)
         
         # Additional hidden layer
         residual = combined
-        combined = Dense(self.params.get('ff_dim'), activation=self.params.get('activation'),
-                        kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(combined)
+        combined = Dense(
+            self.params.get('ff_dim'), 
+            activation=self.params.get('activation'),
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(combined)
+        
         if self.params.get('use_batch_norm', True):
-            combined = BatchNormalization()(combined)
+            combined = BatchNormalization(dtype=NUMERICALLY_SENSITIVE_POLICY)(combined)
         combined = Dropout(self.params.get('dropout_rate'))(combined)
         
         # Add residual connection if dimensions match
         if self.params.get('use_residual_connections', True):
-            combined = Add()([combined, residual])
+            # Use Add layer instead of direct addition
+            combined = Add()([residual, combined])
         
         # Final hidden layer
-        combined = Dense(self.params.get('ff_dim') // 2, activation=self.params.get('activation'),
-                        kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(combined)
+        combined = Dense(
+            self.params.get('ff_dim') // 2, 
+            activation=self.params.get('activation'),
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(combined)
         combined = Dropout(self.params.get('dropout_rate') / 2)(combined)
         
         # Output layers (one for each main number position)
         outputs = []
         for i in range(5):
             # Use a specialized head for each position
-            position_specific = Dense(self.params.get('ff_dim') // 4, activation=self.params.get('activation'))(combined)
+            position_specific = Dense(
+                self.params.get('ff_dim') // 4, 
+                activation=self.params.get('activation'),
+                dtype=COMPUTE_INTENSIVE_POLICY
+            )(combined)
             
-            logits = Dense(50, activation=None, name=f"main_logits_{i+1}")(position_specific)
+            logits = Dense(50, activation=None, name=f"main_logits_{i+1}", dtype=COMPUTE_INTENSIVE_POLICY)(position_specific)
             logits_reshaped = Reshape((50,))(logits)
             output = tf.keras.layers.Activation('softmax', name=f"main_{i+1}")(logits_reshaped)
             outputs.append(output)
@@ -1128,13 +1276,17 @@ class ImprovedTransformerModel:
         
         # Select optimizer based on parameter
         if self.params.get('optimizer', 'adam').lower() == 'adam':
-            optimizer = Adam(learning_rate=self.params.get('learning_rate'))
+            base_optimizer = Adam(learning_rate=self.params.get('learning_rate'))
         elif self.params.get('optimizer', 'adam').lower() == 'sgd':
-            optimizer = SGD(learning_rate=self.params.get('learning_rate'), momentum=0.9)
+            base_optimizer = SGD(learning_rate=self.params.get('learning_rate'), momentum=0.9)
         elif self.params.get('optimizer', 'adam').lower() == 'rmsprop':
-            optimizer = RMSprop(learning_rate=self.params.get('learning_rate'))
+            base_optimizer = RMSprop(learning_rate=self.params.get('learning_rate'))
         else:
-            optimizer = Adam(learning_rate=self.params.get('learning_rate'))
+            base_optimizer = Adam(learning_rate=self.params.get('learning_rate'))
+        
+        # Wrap with loss scale optimizer for mixed precision
+        from tensorflow.keras.mixed_precision import LossScaleOptimizer
+        optimizer = LossScaleOptimizer(base_optimizer)
         
         model.compile(
             optimizer=optimizer,
@@ -1145,46 +1297,77 @@ class ImprovedTransformerModel:
         self.main_model = model
         logger.info("Built improved transformer main numbers model successfully")
         return model
-    
+
     def build_bonus_numbers_model(self):
-        """Build improved transformer model for bonus numbers prediction."""
+        """Build improved transformer model for bonus numbers prediction with selective precision."""
         # Input layers
         feature_input = Input(shape=(self.input_dim,), name="feature_input")
         sequence_input = Input(shape=(self.seq_length, 12), name="sequence_input")
         
-        # Process feature input with multi-layer network
-        x_features = Dense(self.params.get('embed_dim'), activation=self.params.get('activation'),
-                          kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(feature_input)
+        # Process feature input with multi-layer network - compute intensive
+        x_features = Dense(
+            self.params.get('embed_dim'), 
+            activation=self.params.get('activation'),
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(feature_input)
+        
         if self.params.get('use_batch_norm', True):
-            x_features = BatchNormalization()(x_features)
+            x_features = BatchNormalization(dtype=NUMERICALLY_SENSITIVE_POLICY)(x_features)
         x_features = Dropout(self.params.get('dropout_rate'))(x_features)
         
         # Additional hidden layer for features
-        x_features = Dense(self.params.get('embed_dim'), activation=self.params.get('activation'),
-                          kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(x_features)
+        x_features = Dense(
+            self.params.get('embed_dim'), 
+            activation=self.params.get('activation'),
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(x_features)
+        
         if self.params.get('use_batch_norm', True):
-            x_features = BatchNormalization()(x_features)
+            x_features = BatchNormalization(dtype=NUMERICALLY_SENSITIVE_POLICY)(x_features)
         x_features = Dropout(self.params.get('dropout_rate'))(x_features)
         
         # Final feature processing layer
-        x_features = Dense(self.params.get('embed_dim') // 2, activation=self.params.get('activation'),
-                          kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(x_features)
+        x_features = Dense(
+            self.params.get('embed_dim') // 2, 
+            activation=self.params.get('activation'),
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(x_features)
         
         # Process sequence input with convolutional layer first
         if self.params.get('conv_filters', 0) > 0:
-            x_seq = Conv1D(self.params.get('conv_filters'), kernel_size=3, padding='same', 
-                         activation=self.params.get('activation'))(sequence_input)
+            x_seq = Conv1D(
+                self.params.get('conv_filters'), 
+                kernel_size=3, 
+                padding='same', 
+                activation=self.params.get('activation'),
+                dtype=COMPUTE_INTENSIVE_POLICY
+            )(sequence_input)
+            
             # Add additional conv layer
-            x_seq = Conv1D(self.params.get('conv_filters'), kernel_size=5, padding='same', 
-                         activation=self.params.get('activation'))(x_seq)
+            x_seq = Conv1D(
+                self.params.get('conv_filters'), 
+                kernel_size=5, 
+                padding='same', 
+                activation=self.params.get('activation'),
+                dtype=COMPUTE_INTENSIVE_POLICY
+            )(x_seq)
         else:
             x_seq = sequence_input
             
         # Apply dense layer to match dimensions
-        x_seq = Dense(self.params.get('embed_dim'))(x_seq)
+        x_seq = Dense(
+            self.params.get('embed_dim'),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(x_seq)
         
-        # Apply positional encoding
-        x_seq = PositionalEncoding(self.seq_length, self.params.get('embed_dim'))(x_seq)
+        # Apply positional encoding - numerically sensitive
+        x_seq = PositionalEncoding(
+            self.seq_length, 
+            self.params.get('embed_dim')
+        )(x_seq)
         
         # Stack improved transformer blocks
         for _ in range(2):  # Using 2 transformer blocks for bonus numbers
@@ -1197,45 +1380,78 @@ class ImprovedTransformerModel:
         
         # Use bidirectional GRU for advanced sequence processing
         if self.params.get('use_gru', False):
-            x_seq = Bidirectional(GRU(self.params.get('embed_dim') // 2, return_sequences=False))(x_seq)
+            if gpus:
+                # Use optimized GRU implementation
+                x_seq = Bidirectional(GRU(
+                    self.params.get('embed_dim') // 2, 
+                    return_sequences=False,
+                    recurrent_activation='sigmoid',  # Optimized for CuDNN
+                    reset_after=True,  # Required for CuDNN compatibility
+                    name='gpu_optimized_bonus_gru',
+                    dtype=COMPUTE_INTENSIVE_POLICY
+                ))(x_seq)
+            else:
+                x_seq = Bidirectional(GRU(
+                    self.params.get('embed_dim') // 2, 
+                    return_sequences=False,
+                    dtype=COMPUTE_INTENSIVE_POLICY
+                ))(x_seq)
         else:
-            # Global attention pooling
-            x_seq = Attention()([x_seq, x_seq])
+            # Global attention pooling - numerically sensitive
+            x_seq = Attention(dtype=NUMERICALLY_SENSITIVE_POLICY)([x_seq, x_seq])
             x_seq = GlobalAveragePooling1D()(x_seq)
         
         # Combine feature and sequence representations
         combined = Concatenate()([x_features, x_seq])
         
         # Multi-layer processing with residual connections
-        combined = Dense(self.params.get('ff_dim'), activation=self.params.get('activation'),
-                        kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(combined)
+        combined = Dense(
+            self.params.get('ff_dim'), 
+            activation=self.params.get('activation'),
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(combined)
+        
         if self.params.get('use_batch_norm', True):
-            combined = BatchNormalization()(combined)
+            combined = BatchNormalization(dtype=NUMERICALLY_SENSITIVE_POLICY)(combined)
         combined = Dropout(self.params.get('dropout_rate'))(combined)
         
         # Additional hidden layer with residual connection
         residual = combined
-        combined = Dense(self.params.get('ff_dim'), activation=self.params.get('activation'),
-                        kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(combined)
+        combined = Dense(
+            self.params.get('ff_dim'), 
+            activation=self.params.get('activation'),
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(combined)
+        
         if self.params.get('use_batch_norm', True):
-            combined = BatchNormalization()(combined)
+            combined = BatchNormalization(dtype=NUMERICALLY_SENSITIVE_POLICY)(combined)
         combined = Dropout(self.params.get('dropout_rate'))(combined)
         
-        # Add residual connection if enabled
+        # Add residual connection if enabled - Use Add layer instead of direct addition
         if self.params.get('use_residual_connections', True):
-            combined = Add()([combined, residual])
+            combined = Add()([residual, combined])
         
         # Final processing layer
-        combined = Dense(self.params.get('ff_dim') // 2, activation=self.params.get('activation'),
-                        kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')))(combined)
+        combined = Dense(
+            self.params.get('ff_dim') // 2, 
+            activation=self.params.get('activation'),
+            kernel_regularizer=l1_l2(l1=1e-5, l2=self.params.get('weight_decay')),
+            dtype=COMPUTE_INTENSIVE_POLICY
+        )(combined)
         combined = Dropout(self.params.get('dropout_rate') / 2)(combined)
         
         # Output layers with position-specific processing
         outputs = []
         for i in range(2):
-            position_specific = Dense(self.params.get('ff_dim') // 4, activation=self.params.get('activation'))(combined)
+            position_specific = Dense(
+                self.params.get('ff_dim') // 4, 
+                activation=self.params.get('activation'),
+                dtype=COMPUTE_INTENSIVE_POLICY
+            )(combined)
             
-            logits = Dense(12, activation=None, name=f"bonus_logits_{i+1}")(position_specific)
+            logits = Dense(12, activation=None, name=f"bonus_logits_{i+1}", dtype=COMPUTE_INTENSIVE_POLICY)(position_specific)
             logits_reshaped = Reshape((12,))(logits)
             output = tf.keras.layers.Activation('softmax', name=f"bonus_{i+1}")(logits_reshaped)
             outputs.append(output)
@@ -1248,13 +1464,17 @@ class ImprovedTransformerModel:
         
         # Select optimizer
         if self.params.get('optimizer', 'adam').lower() == 'adam':
-            optimizer = Adam(learning_rate=self.params.get('learning_rate'))
+            base_optimizer = Adam(learning_rate=self.params.get('learning_rate'))
         elif self.params.get('optimizer', 'adam').lower() == 'sgd':
-            optimizer = SGD(learning_rate=self.params.get('learning_rate'), momentum=0.9)
+            base_optimizer = SGD(learning_rate=self.params.get('learning_rate'), momentum=0.9)
         elif self.params.get('optimizer', 'adam').lower() == 'rmsprop':
-            optimizer = RMSprop(learning_rate=self.params.get('learning_rate'))
+            base_optimizer = RMSprop(learning_rate=self.params.get('learning_rate'))
         else:
-            optimizer = Adam(learning_rate=self.params.get('learning_rate'))
+            base_optimizer = Adam(learning_rate=self.params.get('learning_rate'))
+        
+        # Wrap with loss scale optimizer for mixed precision
+        from tensorflow.keras.mixed_precision import LossScaleOptimizer
+        optimizer = LossScaleOptimizer(base_optimizer)
         
         model.compile(
             optimizer=optimizer,
@@ -1287,6 +1507,23 @@ class ImprovedLotteryPredictor:
         self.model = None
         self.params = params
         self.feature_importance = None  # For tracking feature importance
+
+    def create_tf_dataset(self, X, sequences, targets, batch_size=16, is_training=True):
+        """Create optimized TensorFlow dataset for GPU acceleration."""
+        # Unpack targets into a list for multi-output model
+        target_list = [targets[:, i] for i in range(targets.shape[1])]
+        
+        # Create dataset
+        dataset = tf.data.Dataset.from_tensor_slices(((X.values, sequences), target_list))
+        
+        if is_training:
+            # Shuffle, batch, and prefetch for training
+            dataset = dataset.cache().shuffle(buffer_size=1000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        else:
+            # Just batch and prefetch for validation/testing
+            dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+            
+        return dataset
     
     def load_and_preprocess_data(self):
         """Load and preprocess lottery data with enhanced features."""
@@ -1429,8 +1666,8 @@ class ImprovedLotteryPredictor:
             raise
 
     def train_models(self, epochs=None, batch_size=None, validation_split=0.1, early_stopping=True):
-        """Train improved transformer-based prediction models with advanced techniques."""
-        logger.info("Training improved transformer-based lottery prediction models")
+        """Train improved transformer-based prediction models with advanced techniques and GPU acceleration."""
+        logger.info("Training improved transformer-based lottery prediction models with GPU acceleration")
         
         try:
             # Load and preprocess data
@@ -1443,20 +1680,42 @@ class ImprovedLotteryPredictor:
             logger.info(f"Main numbers target shape: {y_main.shape}")
             logger.info(f"Bonus numbers target shape: {y_bonus.shape}")
             
-            # Create improved transformer models
-            self.model = ImprovedTransformerModel(
-                input_dim=X_scaled.shape[1],
-                seq_length=self.sequence_length,
-                params=self.params
-            )
+            # Optimize batch size for GPU
+            if gpus:
+                actual_batch_size = batch_size * 2 if batch_size else self.params.get('batch_size', 16) * 2
+                logger.info(f"Using GPU-optimized batch size: {actual_batch_size}")
+            else:
+                actual_batch_size = batch_size if batch_size is not None else self.params.get('batch_size', 16)
+                logger.info(f"Using CPU batch size: {actual_batch_size}")
             
             # Override parameters if provided directly to the method
             actual_epochs = epochs if epochs is not None else self.params.get('epochs', 100)
-            actual_batch_size = batch_size if batch_size is not None else self.params.get('batch_size', 16)
             
-            # Build main numbers model
-            main_model = self.model.build_main_numbers_model()
-            
+            # Setup distribution strategy for multi-GPU if available
+            if gpus and len(gpus) > 1:
+                strategy = tf.distribute.MirroredStrategy()
+                logger.info(f"Training with {strategy.num_replicas_in_sync} GPUs")
+                # Create model in strategy scope
+                with strategy.scope():
+                    self.model = ImprovedTransformerModel(
+                        input_dim=X_scaled.shape[1],
+                        seq_length=self.sequence_length,
+                        params=self.params
+                    )
+                    # Build models
+                    main_model = self.model.build_main_numbers_model()
+                    bonus_model = self.model.build_bonus_numbers_model()
+            else:
+                # Create improved transformer models
+                self.model = ImprovedTransformerModel(
+                    input_dim=X_scaled.shape[1],
+                    seq_length=self.sequence_length,
+                    params=self.params
+                )
+                # Build main numbers model
+                main_model = self.model.build_main_numbers_model()
+                bonus_model = self.model.build_bonus_numbers_model()
+                
             # Set up callbacks with advanced options
             callbacks = []
             
@@ -1479,7 +1738,7 @@ class ImprovedLotteryPredictor:
             
             # Model checkpoint to save best model
             callbacks.append(ModelCheckpoint(
-                filepath="best_main_model.h5",
+                filepath="best_main_model.keras",
                 save_best_only=True,
                 monitor='val_loss',
                 mode='min',
@@ -1511,8 +1770,26 @@ class ImprovedLotteryPredictor:
                     target_lr=initial_lr
                 ))
             
-            # Train with class weights to address imbalance
-            # Calculate class weights based on historical frequency
+            # Create TensorFlow datasets for efficient GPU feeding
+            # Split data for validation
+            val_samples = int(len(X_scaled) * validation_split)
+            train_samples = len(X_scaled) - val_samples
+            
+            # Training data
+            X_train = X_scaled.iloc[:train_samples]
+            main_seq_train = main_sequences[:train_samples]
+            y_main_train = y_main[:train_samples]
+            
+            # Validation data
+            X_val = X_scaled.iloc[train_samples:]
+            main_seq_val = main_sequences[train_samples:]
+            y_main_val = y_main[train_samples:]
+            
+            # Create optimized datasets
+            train_dataset = self.create_tf_dataset(X_train, main_seq_train, y_main_train, batch_size=actual_batch_size)
+            val_dataset = self.create_tf_dataset(X_val, main_seq_val, y_main_val, batch_size=actual_batch_size, is_training=False)
+            
+            # Calculate class weights for main numbers
             main_class_weights = []
             for i in range(5):
                 # Get historical distribution for this position
@@ -1534,6 +1811,53 @@ class ImprovedLotteryPredictor:
                     
                 main_class_weights.append(class_weights)
             
+            # Train with GPU profiling for performance analysis
+            if gpus:
+                # Set up profiling directory
+                profiling_dir = os.path.join(os.getcwd(), 'tf_profiling')
+                os.makedirs(profiling_dir, exist_ok=True)
+                logger.info(f"GPU profiling enabled. Logs will be saved to {profiling_dir}")
+                
+                # Start profiler
+                tf.profiler.experimental.start(profiling_dir)
+            
+            # Train main model with advanced options
+            try:
+                main_history = main_model.fit(
+                    train_dataset,
+                    epochs=actual_epochs,
+                    validation_data=val_dataset,
+                    callbacks=callbacks,
+                    class_weight=main_class_weights,  # Apply class weights
+                    verbose=1
+                )
+                
+                # Save training history
+                with open("main_model_history.json", "w") as f:
+                    json.dump({
+                        "loss": [float(x) for x in main_history.history["loss"]],
+                        "val_loss": [float(x) for x in main_history.history["val_loss"]]
+                    }, f, indent=4)
+                
+                # Load best model from checkpoint
+                if os.path.exists("best_main_model.keras"):
+                    main_model.load_weights("best_main_model.keras")
+                
+            except Exception as e:
+                logger.error(f"Error training main model: {str(e)}")
+            
+            # Prepare bonus number datasets
+            X_train = X_scaled.iloc[:train_samples]
+            bonus_seq_train = bonus_sequences[:train_samples]
+            y_bonus_train = y_bonus[:train_samples]
+            
+            X_val = X_scaled.iloc[train_samples:]
+            bonus_seq_val = bonus_sequences[train_samples:]
+            y_bonus_val = y_bonus[train_samples:]
+            
+            train_bonus_dataset = self.create_tf_dataset(X_train, bonus_seq_train, y_bonus_train, batch_size=actual_batch_size)
+            val_bonus_dataset = self.create_tf_dataset(X_val, bonus_seq_val, y_bonus_val, batch_size=actual_batch_size, is_training=False)
+            
             # Same for bonus numbers
             bonus_class_weights = []
             for i in range(2):
@@ -1553,53 +1877,19 @@ class ImprovedLotteryPredictor:
                     
                 bonus_class_weights.append(class_weights)
             
-            # Train with advanced options
-            try:
-                main_history = main_model.fit(
-                    [X_scaled.values, main_sequences],
-                    [y_main[:, i] for i in range(5)],
-                    epochs=actual_epochs,
-                    batch_size=actual_batch_size,
-                    validation_split=validation_split,
-                    callbacks=callbacks,
-                    class_weight=main_class_weights,  # Apply class weights
-                    verbose=1,
-                    shuffle=True  # Important for time series data
-                )
-                
-                # Save training history
-                with open("main_model_history.json", "w") as f:
-                    json.dump({
-                        "loss": [float(x) for x in main_history.history["loss"]],
-                        "val_loss": [float(x) for x in main_history.history["val_loss"]]
-                    }, f, indent=4)
-                
-                # Load best model from checkpoint
-                if os.path.exists("best_main_model.h5"):
-                    main_model.load_weights("best_main_model.h5")
-                
-            except Exception as e:
-                logger.error(f"Error training main model: {str(e)}")
-            
-            # Build and train bonus numbers model with similar advanced options
-            bonus_model = self.model.build_bonus_numbers_model()
-            
             # Update callbacks for bonus model
             for callback in callbacks:
                 if isinstance(callback, ModelCheckpoint):
-                    callback.filepath = "best_bonus_model.h5"
+                    callback.filepath = "best_bonus_model.keras"
             
             try:
                 bonus_history = bonus_model.fit(
-                    [X_scaled.values, bonus_sequences],
-                    [y_bonus[:, i] for i in range(2)],
+                    train_bonus_dataset,
                     epochs=actual_epochs,
-                    batch_size=actual_batch_size,
-                    validation_split=validation_split,
+                    validation_data=val_bonus_dataset,
                     callbacks=callbacks,
                     class_weight=bonus_class_weights,  # Apply class weights
-                    verbose=1,
-                    shuffle=True
+                    verbose=1
                 )
                 
                 # Save training history
@@ -1610,11 +1900,16 @@ class ImprovedLotteryPredictor:
                     }, f, indent=4)
                 
                 # Load best model from checkpoint
-                if os.path.exists("best_bonus_model.h5"):
-                    bonus_model.load_weights("best_bonus_model.h5")
+                if os.path.exists("best_bonus_model.keras"):
+                    bonus_model.load_weights("best_bonus_model.keras")
                     
             except Exception as e:
                 logger.error(f"Error training bonus model: {str(e)}")
+            
+            # Stop profiler if enabled
+            if gpus:
+                tf.profiler.experimental.stop()
+                logger.info("GPU profiling complete")
             
             return self.model
         except Exception as e:
