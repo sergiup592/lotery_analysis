@@ -57,7 +57,7 @@ BONUS_NUM_MAX = 12
 BONUS_NUM_COUNT = 2
 
 # Model parameters - improved defaults based on empirical results
-DEFAULT_SEQUENCE_LENGTH = 16  # Changed from 20 to better match lottery dynamics
+DEFAULT_SEQUENCE_LENGTH = 20
 DEFAULT_EMBED_DIM = 48  # Adjusted from 64 for better balance
 DEFAULT_NUM_HEADS = 3  # Adjusted from 4 to better suit the task
 DEFAULT_FF_DIM = 96  # Reduced from 128 to prevent overfitting
@@ -648,7 +648,7 @@ class LotteryDataProcessor:
         self.features = None
         self.feature_engineer = None
         self.sequence_length = DEFAULT_SEQUENCE_LENGTH
-        
+    
     def set_sequence_length(self, length):
         """Set the sequence length for data processing."""
         self.sequence_length = length
@@ -699,8 +699,8 @@ class LotteryDataProcessor:
                         if len(parts) >= 4:
                             day = int(parts[1])
                             month_map = {"January": 1, "February": 2, "March": 3, "April": 4, 
-                                       "May": 5, "June": 6, "July": 7, "August": 8, 
-                                       "September": 9, "October": 10, "November": 11, "December": 12}
+                                    "May": 5, "June": 6, "July": 7, "August": 8, 
+                                    "September": 9, "October": 10, "November": 11, "December": 12}
                             month = month_map.get(parts[2], 1)  # Default to January if not found
                             year = int(parts[3])
                             date = datetime(year, month, day)
@@ -738,11 +738,13 @@ class LotteryDataProcessor:
         df["jackpot_value"] = df["jackpot"].str.replace("€", "").str.replace(",", "").astype(float)
         df["is_won"] = df["result"] == "Won"
         
-        # Dynamically determine sequence length based on data size
-        if self.sequence_length is None or self.sequence_length == DEFAULT_SEQUENCE_LENGTH:
+        # Determine sequence length if not already set
+        if self.sequence_length is None:
             optimal_length = Utilities.calculate_optimal_sequence_length(len(df))
             self.sequence_length = optimal_length
             logger.info(f"Dynamically set sequence length to {optimal_length} based on data size")
+        else:
+            logger.info(f"Using sequence length: {self.sequence_length}")
         
         self.data = df
         logger.info(f"Successfully parsed {len(df)} draws")
@@ -1681,7 +1683,7 @@ class ModelBuilder:
         model_type = params.get('model_type', 'transformer')
         lstm_units = params.get('lstm_units', 32)
         
-        # Input layers
+        # Input layers - ensure consistent naming
         feature_input = Input(shape=(input_dim,), name=f"{name_prefix}_feature_input")
         sequence_input = Input(shape=(seq_length, sequence_size), name=f"{name_prefix}_sequence_input")
         
@@ -1704,10 +1706,13 @@ class ModelBuilder:
         if model_type == 'transformer':
             # Transformer-based architecture (default)
             
+            # Fix: Ensure conv_filters is at least 1
+            conv_filters = max(1, params.get('conv_filters', DEFAULT_CONV_FILTERS))
+            
             # Optional convolutional layer for sequence processing
-            if params.get('conv_filters', DEFAULT_CONV_FILTERS) > 0:
+            if conv_filters > 0:  # This check is redundant now but kept for clarity
                 x_seq = Conv1D(
-                    params.get('conv_filters', DEFAULT_CONV_FILTERS), 
+                    conv_filters, 
                     kernel_size=3, 
                     padding='same', 
                     activation="gelu",
@@ -1716,7 +1721,7 @@ class ModelBuilder:
                 x_seq = BatchNormalization()(x_seq)
             else:
                 x_seq = sequence_input
-                
+                    
             # Embedding layer
             x_seq = Dense(
                 params.get('embed_dim', DEFAULT_EMBED_DIM),
@@ -1749,11 +1754,14 @@ class ModelBuilder:
                 ))(x_seq)
             else:
                 x_seq = GlobalAveragePooling1D()(x_seq)
-                
+                    
         elif model_type == 'lstm':
             # LSTM-based architecture
+            # Fix: Ensure conv_filters is at least 1
+            conv_filters = max(1, params.get('conv_filters', DEFAULT_CONV_FILTERS))
+            
             x_seq = Conv1D(
-                params.get('conv_filters', DEFAULT_CONV_FILTERS), 
+                conv_filters, 
                 kernel_size=3, 
                 padding='same', 
                 activation="gelu",
@@ -1800,8 +1808,11 @@ class ModelBuilder:
         
         else:
             # Fallback to CNN architecture
+            # Fix: Ensure conv_filters is at least 1
+            conv_filters = max(1, params.get('conv_filters', DEFAULT_CONV_FILTERS))
+            
             x_seq = Conv1D(
-                params.get('conv_filters', DEFAULT_CONV_FILTERS) * 2, 
+                conv_filters * 2, 
                 kernel_size=5, 
                 padding='same', 
                 activation="gelu",
@@ -1812,7 +1823,7 @@ class ModelBuilder:
             x_seq = Dropout(params.get('dropout_rate', DEFAULT_DROPOUT_RATE))(x_seq)
             
             x_seq = Conv1D(
-                params.get('conv_filters', DEFAULT_CONV_FILTERS), 
+                conv_filters, 
                 kernel_size=3, 
                 padding='same', 
                 activation="gelu",
@@ -1860,7 +1871,7 @@ class ModelBuilder:
             output = Activation('softmax', name=f"{name_prefix}_{i+1}")(logits)
             outputs.append(output)
         
-        # Create model
+        # Create model with explicit list inputs
         model = Model(inputs=[feature_input, sequence_input], outputs=outputs)
         
         # Compile model with metrics
@@ -1959,10 +1970,14 @@ class LotteryModel:
         # Flatten target arrays
         y_main_train_flat = [y_main_train[:, j].flatten() for j in range(MAIN_NUM_COUNT)]
         
-        # Train main model
+        # Ensure inputs are numpy arrays with correct type
+        X_train_arr = np.asarray(X_train)
+        main_seq_train_arr = np.asarray(main_seq_train)
+        
+        # Train main model with explicitly formatted inputs
         logger.info("Training main numbers model")
         main_history = self.main_model.fit(
-            [X_train, main_seq_train],
+            [X_train_arr, main_seq_train_arr],  # Pass as list instead of dict
             y_main_train_flat,
             epochs=actual_epochs,
             batch_size=actual_batch_size,
@@ -1987,10 +2002,13 @@ class LotteryModel:
         # Flatten bonus target arrays
         y_bonus_train_flat = [y_bonus_train[:, j].flatten() for j in range(BONUS_NUM_COUNT)]
         
-        # Train bonus model
+        # Ensure bonus inputs are numpy arrays
+        bonus_seq_train_arr = np.asarray(bonus_seq_train)
+        
+        # Train bonus model with explicitly formatted inputs
         logger.info("Training bonus numbers model")
         bonus_history = self.bonus_model.fit(
-            [X_train, bonus_seq_train],
+            [X_train_arr, bonus_seq_train_arr],  # Pass as list instead of dict
             y_bonus_train_flat,
             epochs=actual_epochs,
             batch_size=actual_batch_size,
@@ -2016,10 +2034,15 @@ class LotteryModel:
     
     @ErrorHandler.handle_exception(logger, "prediction", [])
     def predict(self, features, main_sequence, bonus_sequence, num_draws=5, 
-               temperature=DEFAULT_TEMPERATURE, diversity_sampling=True):
+            temperature=DEFAULT_TEMPERATURE, diversity_sampling=True):
         """Generate predictions using the model."""
         if self.main_model is None or self.bonus_model is None:
             raise ValueError("Models not trained. Train models first.")
+        
+        # Ensure inputs are numpy arrays
+        features_arr = np.asarray(features)
+        main_sequence_arr = np.asarray(main_sequence)
+        bonus_sequence_arr = np.asarray(bonus_sequence)
         
         # Track used numbers for diversity
         used_main_numbers = set()
@@ -2029,11 +2052,11 @@ class LotteryModel:
         predictions = []
         
         for draw_idx in range(num_draws):
-            # Predict main numbers
-            main_probs = self.main_model.predict([features, main_sequence], verbose=0)
+            # Predict main numbers with explicit list inputs
+            main_probs = self.main_model.predict([features_arr, main_sequence_arr], verbose=0)
             
-            # Predict bonus numbers
-            bonus_probs = self.bonus_model.predict([features, bonus_sequence], verbose=0)
+            # Predict bonus numbers with explicit list inputs
+            bonus_probs = self.bonus_model.predict([features_arr, bonus_sequence_arr], verbose=0)
             
             # Calculate confidence scores for dynamic temperature
             main_confidence = np.mean([np.max(main_probs[i][0]) for i in range(MAIN_NUM_COUNT)])
@@ -2044,8 +2067,8 @@ class LotteryModel:
             
             # Apply dynamic temperature based on confidence
             dynamic_temp = Utilities.calculate_dynamic_temperature(overall_confidence, 
-                                                                 min_temp=MIN_TEMPERATURE,
-                                                                 max_temp=MAX_TEMPERATURE)
+                                                                min_temp=MIN_TEMPERATURE,
+                                                                max_temp=MAX_TEMPERATURE)
             
             # Use original temperature for first draw, then use dynamic temperature
             actual_temp = temperature if draw_idx == 0 else dynamic_temp
@@ -2243,24 +2266,29 @@ class EnsemblePredictor:
             diverse_params['num_transformer_blocks'] = random.choice([1, 2, 3])
             diverse_params['use_residual'] = random.choice([True, False])
             diverse_params['use_layer_scaling'] = random.choice([True, False])
+            # Fix: Ensure conv_filters is at least 1
+            diverse_params['conv_filters'] = random.choice([16, 24, 32])
             
         elif architecture == 'lstm':
             # LSTM-specific parameters
             diverse_params['dropout_rate'] = base_params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * (0.9 + 0.3 * random.random())
             diverse_params['lstm_units'] = random.choice([24, 32, 48, 64])
+            # Fix: Ensure conv_filters is at least 1
             diverse_params['conv_filters'] = random.choice([16, 24, 32])
             
         elif architecture == 'rnn':
             # RNN-specific parameters
             diverse_params['dropout_rate'] = base_params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * (0.7 + 0.6 * random.random())
             diverse_params['embed_dim'] = random.choice([32, 48, 64])
+            # Fix: Ensure conv_filters is at least 1
+            diverse_params['conv_filters'] = random.choice([8, 16, 24])
             
         # Common parameter diversity
         # Learning rate diversity - wider range for exploration
         diverse_params['learning_rate'] = base_params.get('learning_rate', DEFAULT_LEARNING_RATE) * (0.5 + 1.0 * random.random())
         
-        # Sequence length diversity - introduces different historical context windows
-        diverse_params['sequence_length'] = random.choice([8, 12, 16, 20, 24])
+        # Fix: Use consistent sequence length
+        diverse_params['sequence_length'] = base_params.get('sequence_length', 20)  # Use existing or default to 20
         
         # Optimizer diversity
         diverse_params['optimizer'] = random.choice(['adam', 'rmsprop', 'sgd'])
@@ -2540,10 +2568,12 @@ class HyperparameterOptimizer:
             'ff_dim': trial.suggest_categorical('ff_dim', [64, 96, 128, 192, 256]),
             'embed_dim': trial.suggest_categorical('embed_dim', [32, 48, 64, 96, 128]),
             'use_gru': trial.suggest_categorical('use_gru', [True, False]),
-            'conv_filters': trial.suggest_int('conv_filters', 0, 64, step=16),
+            # Fix 1: Ensure conv_filters is at least 1
+            'conv_filters': trial.suggest_int('conv_filters', 1, 64, step=16),  # Changed minimum from 0 to 1
             'num_transformer_blocks': trial.suggest_int('num_transformer_blocks', 1, 3),
             'optimizer': trial.suggest_categorical('optimizer', ['adam', 'rmsprop', 'sgd']),
-            'sequence_length': trial.suggest_categorical('sequence_length', [8, 12, 16, 20, 24]),
+            # Fix 2: Fix sequence length to match data preparation
+            'sequence_length': 20,  # Fixed to 20 instead of varying
             'l2_regularization': trial.suggest_float('l2_regularization', 1e-5, 1e-3, log=True),
             'model_type': trial.suggest_categorical('model_type', ['transformer', 'lstm', 'rnn']),
             'use_residual': trial.suggest_categorical('use_residual', [True, False]),
@@ -2984,22 +3014,23 @@ class LotteryPredictionSystem:
     """Enhanced unified prediction system with optimized data processing and model management."""
     
     def __init__(self, file_path, params=None):
-        """Initialize the prediction system with dynamic sequence length."""
+        """Initialize the prediction system with proper sequence length handling."""
         self.file_path = file_path
         self.params = params if params is not None else Utilities.get_default_params()
         
-        # Get sequence length from params or use default
+        # Get sequence length from params if available
         self.sequence_length = self.params.get('sequence_length', DEFAULT_SEQUENCE_LENGTH)
         
-        # Initialize processor with the appropriate sequence length
-        self.processor = LotteryDataProcessor(file_path).set_sequence_length(self.sequence_length)
+        # Initialize processor with the same sequence length
+        self.processor = LotteryDataProcessor(file_path)
+        self.processor.set_sequence_length(self.sequence_length)
         
         self.model = None
         self.feature_scaler = StandardScaler()
         self.X_scaled = None
         self.main_sequences = None
         self.bonus_sequences = None
-        self.data_prepared = False  # Track if data has been prepared
+        self.data_prepared = False
         
     @ErrorHandler.handle_exception(logger, "data preparation")
     def prepare_data(self, force_reload=False):
@@ -3153,7 +3184,7 @@ class LotteryPredictionSystem:
         # Create and build model
         self.model = LotteryModel(self.params)
         
-        # Build models
+        # Build models with the correct sequence length
         input_dim = data_dict["X"].shape[1]
         self.model.build_models(input_dim, self.sequence_length)
         
@@ -3832,6 +3863,37 @@ def generate_visualizations(predictions, file_path, include_historical=True):
     logger.info("Enhanced visualizations saved to lottery_predictions.png, pattern_analysis.png, and number_correlation.png")
     return ["lottery_predictions.png", "pattern_analysis.png", "number_correlation.png"]
 
+
+def configure_tensorflow():
+    """Configure TensorFlow to reduce warnings and optimize performance."""
+    # Reduce threading warnings
+    try:
+        tf.config.threading.set_inter_op_parallelism_threads(1)
+        tf.config.threading.set_intra_op_parallelism_threads(1)
+    except:
+        pass
+    
+    # Set logging level to suppress warnings
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+    
+    # Disable eager execution for better performance with graph mode
+    try:
+        tf.compat.v1.disable_eager_execution()
+    except:
+        pass
+    
+    # Set GPU memory growth
+    try:
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+    except:
+        pass
+    
+    logger.info("TensorFlow configured for optimal performance")
+
+
 #######################
 # MAIN FUNCTION
 #######################
@@ -3848,13 +3910,14 @@ def main():
     parser.add_argument("--ensemble", action="store_true", help="Use ensemble for improved predictions")
     parser.add_argument("--num_models", type=int, default=5, help="Number of models in ensemble")
     parser.add_argument("--params", default="transformer_params.json", help="Path to parameters file")
-    parser.add_argument("--sequence_length", type=int, default=None, help="Sequence length for historical data")
+    parser.add_argument("--sequence_length", type=int, default=20, help="Sequence length for historical data")
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help="Temperature for sampling")
     parser.add_argument("--output", default="predictions.json", help="Output file for predictions")
 
     args = parser.parse_args()
     
     try:
+        configure_tensorflow()
         # Print header
         print("\n" + "="*80)
         print("ENHANCED TRANSFORMER-BASED EUROMILLIONS LOTTERY PREDICTION SYSTEM".center(80))
