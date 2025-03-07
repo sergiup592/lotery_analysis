@@ -1,19 +1,19 @@
 #!/usr/bin/env python
 """
-Default command
-python neural_pred.py --file lottery_numbers.txt --predictions 30 --evaluate
+Usage:
 
-Step 1: Optimize hyperparameters, this will find the best hyperparameters and save them to transformer_params.json.
-python neural_pred.py --file lottery_numbers.txt --optimize --trials 50
+On remote for more computer:
+#optimize hyper parameters
+python neural_pred.py --file lottery_numbers.txt --optimize --trials 100 --evaluate --output remote_predictions.json
+#train the full model
+python neural_pred.py --file lottery_numbers.txt --params hybrid_best_params.json --force_train --predictions 0
 
-Step 2: Train models and generate predictions using optimized parameters
-python neural_pred.py --file lottery_numbers.txt --params transformer_params.json --ensemble --num_models 7 --predictions 30 --evaluate
-
-
+locally:
+#Generate predictions locally
+python neural_pred.py --file lottery_numbers.txt --params hybrid_best_params.json --load_existing --evaluate --predictions 30 --match_recent
 """
-
-import os
 import sys
+import os
 import re
 import json
 import random
@@ -25,17 +25,21 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
-    Input, Dense, Dropout, MultiHeadAttention, LayerNormalization,
-    GlobalAveragePooling1D, Concatenate, GRU, Conv1D,
-    Bidirectional, BatchNormalization, Activation, LSTM, SimpleRNN
+    Input, Dense, LSTM, Dropout, BatchNormalization, Bidirectional,
+    GRU, Conv1D, GlobalAveragePooling1D, MultiHeadAttention, LayerNormalization,
+    SimpleRNN, Activation, Concatenate
 )
 from tensorflow.keras.optimizers import Adam, SGD, RMSprop
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.callbacks import (
+    EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+)
+from tensorflow.keras.regularizers import l2
 import optuna
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
@@ -56,61 +60,95 @@ BONUS_NUM_MIN = 1
 BONUS_NUM_MAX = 12
 BONUS_NUM_COUNT = 2
 
-# Model parameters - improved defaults based on empirical results
+# Model parameters - hybridized from both approaches
 DEFAULT_SEQUENCE_LENGTH = 20
-DEFAULT_EMBED_DIM = 48  # Adjusted from 64 for better balance
-DEFAULT_NUM_HEADS = 3  # Adjusted from 4 to better suit the task
-DEFAULT_FF_DIM = 96  # Reduced from 128 to prevent overfitting
-DEFAULT_DROPOUT_RATE = 0.35  # Increased from 0.3 for stronger regularization
-DEFAULT_BATCH_SIZE = 32  # Increased from 16 for better stability
-DEFAULT_EPOCHS = 80  # Reduced from 100 to avoid overfitting
-DEFAULT_LEARNING_RATE = 0.0008  # Reduced from 0.001 for better convergence
+DEFAULT_EMBED_DIM = 56
+DEFAULT_NUM_HEADS = 4
+DEFAULT_FF_DIM = 112
+DEFAULT_DROPOUT_RATE = 0.35
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_EPOCHS = 80
+DEFAULT_LEARNING_RATE = 0.0008
 DEFAULT_TRANSFORMER_BLOCKS = 2
-DEFAULT_CONV_FILTERS = 24  # Optimized from 32
-DEFAULT_PATIENCE = 10  # Reduced from 15 for earlier stopping
+DEFAULT_CONV_FILTERS = 28
+DEFAULT_PATIENCE = 12
 
-# Confidence calibration factors - refined based on statistical analysis
-MAIN_CONF_SCALE = 0.55  # Reduced from 0.6 for more conservative estimations
-MAIN_CONF_OFFSET = 0.18  # Reduced from 0.2 for more conservative estimations
-BONUS_CONF_SCALE = 0.65  # Reduced from 0.7 for more conservative estimations
-BONUS_CONF_OFFSET = 0.12  # Reduced from 0.15 for more conservative estimations
+# Confidence calibration factors
+MAIN_CONF_SCALE = 0.55
+MAIN_CONF_OFFSET = 0.18
+BONUS_CONF_SCALE = 0.65
+BONUS_CONF_OFFSET = 0.12
 
-# Feature selection - increased to include more features
-MAX_FEATURES = 400  # Increased from 300
+# Feature selection
+MAX_FEATURES = 450
 
-# Temperature scaling for sampling - more dynamic approach
-DEFAULT_TEMPERATURE = 0.75  # Base temperature adjusted from 0.8
-MIN_TEMPERATURE = 0.6  # Minimum temperature for high confidence predictions
-MAX_TEMPERATURE = 1.2  # Maximum temperature for low confidence predictions
-DIVERSITY_FACTOR = 0.85  # Increased from 0.8 for more diverse results
+# Temperature scaling for sampling
+DEFAULT_TEMPERATURE = 0.75
+MIN_TEMPERATURE = 0.6
+MAX_TEMPERATURE = 1.2
+DIVERSITY_FACTOR = 0.85
 
-# Memory management constants - optimized frequency
-CLEAN_MEMORY_FREQUENCY = 8  # Reduced from 10 for more frequent cleanup with less impact
+# Memory management constants
+CLEAN_MEMORY_FREQUENCY = 8
 
 # Early stopping threshold for loss improvement
-MIN_DELTA = 0.001  # Minimum change in the monitored quantity to qualify as improvement
+MIN_DELTA = 0.001
 
-# Configure GPU if available
+# Directory constants
+MODEL_DIR = "models"
+CACHE_DIR = "cache"
+LOG_DIR = "logs"
+VISUALIZATION_DIR = "visualizations"
+
+# Create necessary directories
+for directory in [MODEL_DIR, CACHE_DIR, LOG_DIR, VISUALIZATION_DIR]:
+    os.makedirs(directory, exist_ok=True)
+
+#######################
+# SETUP AND UTILITIES
+#######################
+
+# Configure GPU usage
 def configure_gpu():
-    """Configure GPU with proper memory growth if available."""
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        try:
-            # Configure GPU memory growth to avoid taking all memory at once
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            
-            # Set TensorFlow memory allocator
-            tf.config.experimental.set_memory_growth(gpus[0], True)
+    """Configure TensorFlow to use one or more GPUs if available."""
+    try:
+        # Check for available GPUs
+        physical_devices = tf.config.list_physical_devices('GPU')
+        if len(physical_devices) > 0:
+            # Enable memory growth for all GPUs to prevent memory allocation errors
+            for device in physical_devices:
+                try:
+                    tf.config.experimental.set_memory_growth(device, True)
+                    print(f"Memory growth enabled for {device}")
+                except Exception as e:
+                    print(f"Could not set memory growth for {device}: {e}")
             
             # Set TensorFlow to only log errors
             os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
             
-            return f"Found {len(gpus)} GPU(s), configured for optimal memory usage"
-        except RuntimeError as e:
-            return f"GPU configuration error: {e}"
+            print(f"GPU support enabled - {len(physical_devices)} GPU(s) available")
+            return len(physical_devices)
+        else:
+            print("No GPU detected. Using CPU for training.")
+            return 0
+    except Exception as e:
+        print(f"Error configuring GPU: {str(e)}")
+        print("Falling back to CPU training.")
+        return 0
+    
+def create_distribution_strategy():
+    """Create an appropriate distribution strategy based on available hardware."""
+    num_gpus = configure_gpu()
+    
+    if num_gpus > 1:
+        print(f"Creating MirroredStrategy for {num_gpus} GPUs")
+        return tf.distribute.MirroredStrategy()
+    elif num_gpus == 1:
+        print("Creating OneDeviceStrategy for single GPU")
+        return tf.distribute.OneDeviceStrategy(device="/gpu:0")
     else:
-        return "No GPU found. Using CPU."
+        print("Creating default strategy for CPU")
+        return tf.distribute.get_strategy()
 
 # Set up consistent seeds
 def set_seeds(seed=RANDOM_SEED):
@@ -121,6 +159,33 @@ def set_seeds(seed=RANDOM_SEED):
     os.environ['PYTHONHASHSEED'] = str(seed)
     os.environ['TF_DETERMINISTIC_OPS'] = '1'
 
+def optimize_memory_usage():
+    """Apply memory optimization settings for multi-GPU training."""
+    # Limit TensorFlow memory growth
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError as e:
+                print(f"Memory growth setting failed: {e}")
+        
+        # Optional: Set memory limit per GPU (uncomment if needed)
+        # for gpu in gpus:
+        #    tf.config.experimental.set_virtual_device_configuration(
+        #        gpu,
+        #        [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=4096)]
+        #    )
+    
+    # TensorFlow mixed precision for faster training
+    try:
+        policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        tf.keras.mixed_precision.set_global_policy(policy)
+        print("Mixed precision policy set to mixed_float16")
+    except:
+        print("Could not set mixed precision policy")
+
+
 # Set up logging with a configurable level
 def setup_logging(level=logging.INFO):
     """Set up logging with file and console handlers."""
@@ -128,7 +193,7 @@ def setup_logging(level=logging.INFO):
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler("enhanced_transformer.log", mode='w'),
+            logging.FileHandler("hybrid_neural_lottery.log", mode='w'),
             logging.StreamHandler()
         ]
     )
@@ -136,6 +201,87 @@ def setup_logging(level=logging.INFO):
     # Hide TensorFlow warnings
     tf.get_logger().setLevel('ERROR')
     return logger
+
+def evaluate_predictions_against_recent(predictions, file_path, num_recent=5):
+    """Evaluate predictions against the most recent draws.
+    
+    Args:
+        predictions: List of prediction dictionaries
+        file_path: Path to lottery data file
+        num_recent: Number of recent draws to evaluate against
+        
+    Returns:
+        Dictionary with evaluation metrics
+    """
+    print(f"Evaluating predictions against {num_recent} most recent draws...")
+    
+    # Load data
+    processor = LotteryDataProcessor(file_path)
+    data = processor.parse_file()
+    
+    if data.empty or len(data) < num_recent:
+        print("Not enough historical data for evaluation")
+        return {
+            'success': False,
+            'error': 'Insufficient historical data'
+        }
+    
+    # Get recent draws
+    recent_draws = data.tail(num_recent)
+    
+    # Evaluate each prediction against each recent draw
+    results = []
+    
+    for i, prediction in enumerate(predictions):
+        draw_scores = []
+        
+        for _, row in recent_draws.iterrows():
+            # Format actual draw
+            actual_draw = {
+                "main_numbers": row["main_numbers"],
+                "main_number_positions": {num: i for i, num in enumerate(row["main_numbers"])},
+                "bonus_numbers": row["bonus_numbers"]
+            }
+            
+            # Calculate match score
+            match_score = Utilities.calculate_partial_match_score(prediction, actual_draw)
+            
+            draw_date = row["date"].strftime("%Y-%m-%d") if hasattr(row["date"], "strftime") else str(row["date"])
+            
+            draw_scores.append({
+                "draw_date": draw_date,
+                "match_score": match_score,
+                "main_matches": len(set(prediction["main_numbers"]).intersection(set(row["main_numbers"]))),
+                "bonus_matches": len(set(prediction["bonus_numbers"]).intersection(set(row["bonus_numbers"])))
+            })
+        
+        # Find best matching draw
+        best_match = max(draw_scores, key=lambda x: x["match_score"]) if draw_scores else None
+        
+        results.append({
+            "prediction_index": i + 1,
+            "main_numbers": prediction["main_numbers"],
+            "bonus_numbers": prediction["bonus_numbers"],
+            "confidence": prediction["confidence"]["overall"],
+            "draw_scores": draw_scores,
+            "best_match": best_match,
+            "avg_score": np.mean([s["match_score"] for s in draw_scores]) if draw_scores else 0.0
+        })
+    
+    # Calculate overall metrics
+    avg_match_score = np.mean([r["avg_score"] for r in results]) if results else 0.0
+    best_prediction = max(results, key=lambda x: x["avg_score"]) if results else None
+    
+    print(f"Evaluation complete: Average Match Score = {avg_match_score:.4f}")
+    if best_prediction:
+        print(f"Best prediction ({best_prediction['avg_score']:.4f}): {best_prediction['main_numbers']} + {best_prediction['bonus_numbers']}")
+    
+    return {
+        'success': True,
+        'avg_match_score': avg_match_score,
+        'detailed_results': results,
+        'best_prediction': best_prediction
+    }
 
 # Initialize logger
 logger = setup_logging()
@@ -171,10 +317,6 @@ class ErrorHandler:
                     raise
             return wrapper
         return decorator
-
-#######################
-# UTILITIES
-#######################
 
 class Utilities:
     """Unified utility class for shared functionality."""
@@ -245,9 +387,27 @@ class Utilities:
         if confidence is not None:
             temperature = Utilities.calculate_dynamic_temperature(confidence)
         
+        # Convert probs to array format if needed
+        if isinstance(probs, list) and isinstance(probs[0], np.ndarray):
+            # Already in the expected format
+            position_probs_list = probs
+        else:
+            # Convert to list of position probabilities
+            position_probs_list = []
+            for i in range(num_to_select):
+                if isinstance(probs[i], np.ndarray):
+                    position_probs_list.append(probs[i])
+                else:
+                    # Reshape to expected format
+                    position_probs_list.append(np.array([probs[i]]))
+        
         for i in range(num_to_select):
             # Get probability distribution for this position
-            position_probs = probs[i][0]
+            if i < len(position_probs_list):
+                position_probs = position_probs_list[i][0]
+            else:
+                # Fallback to uniform distribution if position probs not available
+                position_probs = np.ones(max(available_nums)) / max(available_nums)
             
             # Apply temperature scaling
             position_probs = np.power(position_probs, 1/max(0.1, temperature))
@@ -259,7 +419,12 @@ class Utilities:
             adjusted_probs = np.zeros(len(position_probs))
             for num in available:
                 if 1 <= num <= len(position_probs):  # Ensure index is valid
-                    adjusted_probs[num-1] = position_probs[num-1]
+                    # Handle different probabilities format
+                    prob_value = position_probs[num-1]
+                    # If prob_value is an array or sequence, take its first element
+                    if hasattr(prob_value, '__len__') and not isinstance(prob_value, (str, bytes)):
+                        prob_value = prob_value[0]
+                    adjusted_probs[num-1] = prob_value
                     
                     # Apply progressive diversity penalty - scales with draw_idx
                     if diversity_sampling and used_nums and num in used_nums and draw_idx > 0:
@@ -308,38 +473,18 @@ class Utilities:
     @staticmethod
     def calculate_pattern_score(main_numbers, bonus_numbers=None):
         """Calculate pattern score based on historical patterns with improved metrics."""
-        # Simple pattern checks
-        # 1. Check distribution across range
-        main_bins = [0, 0, 0, 0, 0]  # 1-10, 11-20, 21-30, 31-40, 41-50
+        # Check distribution across range
+        main_bins = [0] * 5  # 1-10, 11-20, 21-30, 31-40, 41-50
         for num in main_numbers:
             bin_idx = (num - 1) // 10
             if 0 <= bin_idx < 5:
                 main_bins[bin_idx] += 1
         
-        # Ideal distribution tends to be more spread out (1-2 numbers per bin)
-        # Calculate the variance of the bins - lower variance is better
+        # Calculate distribution score - balanced distribution is better
         bin_variance = np.var(main_bins)
-        distribution_score = 1.0 / (1.0 + bin_variance)  # Higher variance -> lower score
+        distribution_score = 1.0 / (1.0 + bin_variance)
         
-        # 2. Check for consecutive numbers
-        consecutive_count = 0
-        for i in range(len(main_numbers) - 1):
-            if main_numbers[i + 1] - main_numbers[i] == 1:
-                consecutive_count += 1
-        
-        # Calculate average gap between numbers
-        gaps = [main_numbers[i+1] - main_numbers[i] for i in range(len(main_numbers)-1)]
-        avg_gap = np.mean(gaps) if gaps else 0
-        
-        # Balance between not too many consecutive and reasonable gap size
-        if consecutive_count <= 1 and 5 <= avg_gap <= 15:
-            consecutive_score = 0.9
-        elif consecutive_count == 2 or (3 <= avg_gap <= 18):
-            consecutive_score = 0.7
-        else:
-            consecutive_score = 0.5
-        
-        # 3. Check for even/odd balance
+        # Check odd/even balance
         even_count = sum(1 for n in main_numbers if n % 2 == 0)
         
         # Ideal balance is 2-3 or 3-2
@@ -350,16 +495,41 @@ class Utilities:
         else:
             balance_score = 0.5  # All even or all odd is rare
             
-        # 4. Check sum of numbers - most common sums fall in certain ranges
+        # Check sum of numbers - most common sums fall in certain ranges
         num_sum = sum(main_numbers)
-        if 120 <= num_sum <= 180:  # Most common range
+        if 120 <= num_sum <= 170:
             sum_score = 0.9
-        elif 100 <= num_sum <= 200:  # Wider common range
+        elif 100 <= num_sum <= 200:
             sum_score = 0.7
         else:
-            sum_score = 0.5  # Uncommon sum
+            sum_score = 0.5
+            
+        # Check for consecutive numbers - having 0 or 1 is better
+        consecutive_count = 0
+        sorted_nums = sorted(main_numbers)
+        for i in range(len(sorted_nums) - 1):
+            if sorted_nums[i + 1] - sorted_nums[i] == 1:
+                consecutive_count += 1
+                
+        if consecutive_count <= 1:
+            consecutive_score = 0.9
+        elif consecutive_count == 2:
+            consecutive_score = 0.7
+        else:
+            consecutive_score = 0.5
+            
+        # Calculate average gaps
+        gaps = [sorted_nums[i+1] - sorted_nums[i] for i in range(len(sorted_nums)-1)]
+        avg_gap = np.mean(gaps) if gaps else 0
         
-        # 5. Check low-high balance (numbers below and above 25)
+        if 8 <= avg_gap <= 12:
+            gap_score = 0.9
+        elif 6 <= avg_gap <= 15:
+            gap_score = 0.7
+        else:
+            gap_score = 0.5
+            
+        # Check low/high distribution (numbers below and above 25)
         low_count = sum(1 for n in main_numbers if n <= 25)
         if 2 <= low_count <= 3:  # Balanced
             low_high_score = 0.9
@@ -367,29 +537,39 @@ class Utilities:
             low_high_score = 0.7
         else:
             low_high_score = 0.5  # Very imbalanced
-        
+            
         # Combine scores with weights
         pattern_score = (
             0.25 * distribution_score + 
-            0.2 * consecutive_score + 
             0.2 * balance_score + 
             0.15 * sum_score + 
-            0.2 * low_high_score
+            0.15 * consecutive_score +
+            0.1 * gap_score +
+            0.15 * low_high_score
         )
         
         # Bonus number pattern (if provided)
         if bonus_numbers and len(bonus_numbers) >= 2:
-            # Check if bonus numbers are close or far apart
-            bonus_gap = abs(bonus_numbers[1] - bonus_numbers[0])
-            if 2 <= bonus_gap <= 6:  # Most common gap
+            # Check bonus numbers distribution
+            bonus_diff = abs(bonus_numbers[1] - bonus_numbers[0])
+            if 2 <= bonus_diff <= 6:  # Most common gap
                 bonus_score = 0.9
-            elif 1 <= bonus_gap <= 8:  # Wider common range
+            elif 1 <= bonus_diff <= 8:  # Wider common range
                 bonus_score = 0.7
             else:
                 bonus_score = 0.5  # Uncommon gap
+                
+            # Check even/odd balance in bonus numbers
+            bonus_even = sum(1 for n in bonus_numbers if n % 2 == 0)
+            if bonus_even == 1:  # One even, one odd is most common
+                bonus_balance_score = 0.9
+            else:
+                bonus_balance_score = 0.6  # Both even or both odd is less common
+                
+            bonus_combined_score = (bonus_score + bonus_balance_score) / 2
             
             # Combine with main score
-            pattern_score = 0.85 * pattern_score + 0.15 * bonus_score
+            pattern_score = 0.85 * pattern_score + 0.15 * bonus_combined_score
             
         return pattern_score
     
@@ -465,12 +645,11 @@ class Utilities:
         main_recent_score_norm = np.clip(main_recent_score, 0, 1)
         bonus_recent_score_norm = np.clip(bonus_recent_score, 0, 1)
         
-        # Combine scores with weights
-        # More emphasis on long-term frequency but some weight to recency
+        # Combine scores with weights - more emphasis on long-term frequency
         combined_main_score = 0.7 * main_score_norm + 0.3 * main_recent_score_norm
         combined_bonus_score = 0.7 * bonus_score_norm + 0.3 * bonus_recent_score_norm
         
-        return (combined_main_score + combined_bonus_score) / 2
+        return (combined_main_score * 0.8 + combined_bonus_score * 0.2)
     
     @staticmethod
     def calculate_partial_match_score(prediction, actual_draw):
@@ -500,7 +679,7 @@ class Utilities:
         # Add position accuracy bonus for main numbers if appropriate
         if main_matches > 0 and "main_number_positions" in prediction and "main_number_positions" in actual_draw:
             position_matches = sum(1 for num in main_pred.intersection(main_actual) 
-                                if prediction["main_number_positions"].get(num) == actual_draw["main_number_positions"].get(num))
+                                if prediction["main_number_positions"].get(str(num)) == actual_draw["main_number_positions"].get(str(num)))
             position_bonus = (position_matches / max(1, main_matches)) * 0.05
             total_score += position_bonus
         
@@ -522,12 +701,20 @@ class Utilities:
             'optimizer': 'adam',
             'num_transformer_blocks': DEFAULT_TRANSFORMER_BLOCKS,
             'sequence_length': DEFAULT_SEQUENCE_LENGTH,
-            'l2_regularization': 0.0001,  # New parameter for L2 regularization
-            'model_type': 'transformer',  # New parameter for model architecture type
-            'lstm_units': 32,  # New parameter for LSTM-based models
-            'min_delta': MIN_DELTA,  # New parameter for early stopping threshold
-            'use_residual': True,  # New parameter for using residual connections
-            'use_layer_scaling': True,  # New parameter for layer scaling in transformer
+            'l2_regularization': 0.0001,
+            'model_type': 'transformer',
+            'lstm_units': 32,
+            'min_delta': MIN_DELTA,
+            'use_residual': True,
+            'use_layer_scaling': True,
+            'use_frequency_model': True,
+            'use_pattern_model': True,
+            'use_transformer_model': True,
+            'ensemble_weights': {
+                'transformer': 0.4,
+                'frequency': 0.3,
+                'pattern': 0.3
+            }
         }
     
     @staticmethod
@@ -569,7 +756,7 @@ class Utilities:
     
     @staticmethod
     def get_model_callbacks(model_types=None, patience=DEFAULT_PATIENCE, include_checkpoint=True, 
-                         base_path="models/best", include_timestamp=True, min_delta=MIN_DELTA):
+                           base_path="models/best", include_timestamp=True, min_delta=MIN_DELTA):
         """Get consistent callbacks for multiple model types at once."""
         if model_types is None:
             model_types = ["main"]  # Default to just main model
@@ -581,16 +768,16 @@ class Utilities:
             # Early stopping - improved with min_delta parameter
             EarlyStopping(
                 patience=patience,
-                restore_best_weights=True,
+                restore_best_weights=True,  # Important: restore weights in memory
                 monitor='val_loss',
                 min_delta=min_delta,
                 verbose=1
             ),
             # Learning rate scheduler - improved with more gradual reduction
             ReduceLROnPlateau(
-                factor=0.6,  # More gradual reduction than 0.7
-                patience=max(3, patience // 3),  # More responsive to plateaus
-                min_lr=5e-7,  # Lower limit to allow more exploration
+                factor=0.7,
+                patience=max(3, patience // 3),
+                min_lr=1e-6,
                 monitor='val_loss',
                 verbose=1
             )
@@ -600,17 +787,26 @@ class Utilities:
         model_callbacks = {}
         checkpoint_paths = {}
         
+        # Use weights-only saving
+        save_weights_only = True
+        
         # Add model-specific callbacks if needed
         for model_type in model_types:
             model_callbacks[model_type] = common_callbacks.copy()
             
             # Add checkpoint callback if requested
             if include_checkpoint:
+                # Use proper extension based on save_weights_only flag
+                if save_weights_only:
+                    extension = ".weights.h5"
+                else:
+                    extension = ".keras"
+                    
                 if include_timestamp:
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filepath = f"{base_path}_{model_type}_{timestamp}.keras"
+                    filepath = f"{base_path}_{model_type}_{timestamp}{extension}"
                 else:
-                    filepath = f"{base_path}_{model_type}.keras"
+                    filepath = f"{base_path}_{model_type}{extension}"
                 
                 # Create directory if it doesn't exist
                 directory = os.path.dirname(os.path.abspath(filepath))
@@ -622,6 +818,7 @@ class Utilities:
                     save_best_only=True,
                     monitor='val_loss',
                     mode='min',
+                    save_weights_only=save_weights_only,
                     verbose=1
                 )
                 model_callbacks[model_type].append(checkpoint_callback)
@@ -639,42 +836,92 @@ class Utilities:
 #######################
 
 class LotteryDataProcessor:
-    """Enhanced processor for lottery data from text files."""
+    """Enhanced processor for lottery data from various sources."""
     
-    def __init__(self, file_path):
+    def __init__(self, file_path=None, data=None):
+        """Initialize with either a file path or direct data"""
         self.file_path = file_path
+        self.raw_data = data
         self.data = None
         self.expanded_data = None
         self.features = None
-        self.feature_engineer = None
         self.sequence_length = DEFAULT_SEQUENCE_LENGTH
+        
+        # Feature scalers
+        self.feature_scaler = StandardScaler()
+        
+        # Cache
+        self.cache_file = os.path.join(CACHE_DIR, "data_processor_cache.pkl")
     
     def set_sequence_length(self, length):
         """Set the sequence length for data processing."""
         self.sequence_length = length
         return self
-        
+    
+    def load_cache(self):
+        """Load cached data if available."""
+        if os.path.exists(self.cache_file):
+            try:
+                cache = np.load(self.cache_file, allow_pickle=True).item()
+                
+                # Match file path or content hash to verify cache validity
+                if ((self.file_path and cache.get('file_path') == self.file_path) or 
+                    (self.raw_data is not None and cache.get('data_hash') == hash(str(self.raw_data)))):
+                    logger.info("Using cached processed data")
+                    self.data = cache.get('data')
+                    self.expanded_data = cache.get('expanded_data')
+                    self.features = cache.get('features')
+                    self.feature_scaler = cache.get('feature_scaler')
+                    return True
+            except Exception as e:
+                logger.warning(f"Error loading cache: {str(e)}")
+                
+        return False
+    
+    def save_cache(self):
+        """Save processed data to cache."""
+        try:
+            # Create dir if not exists
+            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+            
+            cache = {
+                'file_path': self.file_path,
+                'data_hash': hash(str(self.raw_data)) if self.raw_data is not None else None,
+                'data': self.data,
+                'expanded_data': self.expanded_data,
+                'features': self.features,
+                'feature_scaler': self.feature_scaler
+            }
+            
+            np.save(self.cache_file, cache)
+            logger.info(f"Data processing cache saved to {self.cache_file}")
+        except Exception as e:
+            logger.warning(f"Could not save cache: {e}")
+    
     @ErrorHandler.handle_exception(logger, "lottery data parsing", pd.DataFrame())
     def parse_file(self):
-        """Parse the lottery data file into a structured DataFrame."""
-        logger.info(f"Parsing lottery data from {self.file_path}")
-        
-        if not os.path.exists(self.file_path):
-            logger.error(f"Lottery data file not found: {self.file_path}")
-            return pd.DataFrame()
+        """Parse lottery data from file or raw data with enhanced pattern matching."""
+        # Check cache first
+        if self.load_cache():
+            return self.data
             
-        with open(self.file_path, 'r') as file:
-            content = file.read()
+        logger.info("Parsing lottery data")
         
-        # Improved regex pattern - more robust to variations in formatting
+        if self.raw_data is not None:
+            content = self.raw_data
+        elif self.file_path and os.path.exists(self.file_path):
+            with open(self.file_path, 'r') as file:
+                content = file.read()
+        else:
+            raise ValueError("No valid data source provided")
+            
+        # Improved regex for more robust matching
         draw_pattern = r"((?:\w+)\s+\d+(?:st|nd|rd|th)?\s+(?:\w+)\s+\d{4})\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(€[\d,]+)\s+(Roll|Won)"
         draws = re.findall(draw_pattern, content)
         
         if not draws:
-            logger.error(f"No valid draws found in {self.file_path}")
-            return pd.DataFrame()
-        
-        # Process extracted data
+            raise ValueError("No valid draws found in data")
+            
         structured_data = []
         
         for draw in draws:
@@ -682,7 +929,7 @@ class LotteryDataProcessor:
                 date_str = draw[0]
                 main_numbers = [int(draw[i]) for i in range(1, 6)]
                 bonus_numbers = [int(draw[i]) for i in range(6, 8)]
-                jackpot = draw[8]
+                jackpot_str = draw[8]
                 result = draw[9]
                 
                 # Improved date parsing
@@ -690,26 +937,31 @@ class LotteryDataProcessor:
                 try:
                     date = datetime.strptime(clean_date_str, "%A %d %B %Y")
                 except ValueError:
-                    # Try alternative format
                     try:
                         date = datetime.strptime(clean_date_str, "%a %d %b %Y")
                     except ValueError:
-                        # If both fail, extract components manually
+                        # Extract parts manually as last resort
                         parts = clean_date_str.split()
                         if len(parts) >= 4:
                             day = int(parts[1])
                             month_map = {"January": 1, "February": 2, "March": 3, "April": 4, 
-                                    "May": 5, "June": 6, "July": 7, "August": 8, 
-                                    "September": 9, "October": 10, "November": 11, "December": 12}
+                                       "May": 5, "June": 6, "July": 7, "August": 8, 
+                                       "September": 9, "October": 10, "November": 11, "December": 12}
                             month = month_map.get(parts[2], 1)  # Default to January if not found
                             year = int(parts[3])
                             date = datetime(year, month, day)
                         else:
-                            # Last resort, create a dummy date
-                            date = datetime(2000, 1, 1)
+                            # Last resort, use current date
+                            date = datetime.now()
                             logger.warning(f"Could not parse date: {date_str}, using default")
-            
-                # Create main numbers position map for position accuracy metrics
+                
+                # Extract jackpot value
+                try:
+                    jackpot_value = float(jackpot_str.replace('€', '').replace(',', ''))
+                except ValueError:
+                    jackpot_value = 0.0
+                    
+                # Create main numbers position map
                 main_positions = {num: idx for idx, num in enumerate(main_numbers)}
                 
                 structured_data.append({
@@ -718,11 +970,12 @@ class LotteryDataProcessor:
                     "main_numbers": sorted(main_numbers),
                     "main_number_positions": main_positions,
                     "bonus_numbers": sorted(bonus_numbers),
-                    "jackpot": jackpot,
+                    "jackpot": jackpot_str,
+                    "jackpot_value": jackpot_value,
                     "result": result
                 })
             except Exception as e:
-                logger.warning(f"Could not parse draw: {draw}, error: {e}")
+                logger.warning(f"Error parsing draw: {str(e)}")
                 continue
         
         # Convert to DataFrame and sort by date
@@ -734,30 +987,31 @@ class LotteryDataProcessor:
             
         df = df.sort_values("date")
         
-        # Extract jackpot value as numeric
-        df["jackpot_value"] = df["jackpot"].str.replace("€", "").str.replace(",", "").astype(float)
-        df["is_won"] = df["result"] == "Won"
-        
         # Determine sequence length if not already set
         if self.sequence_length is None:
             optimal_length = Utilities.calculate_optimal_sequence_length(len(df))
             self.sequence_length = optimal_length
-            logger.info(f"Dynamically set sequence length to {optimal_length} based on data size")
-        else:
-            logger.info(f"Using sequence length: {self.sequence_length}")
+            logger.info(f"Dynamic sequence length set to {optimal_length}")
         
         self.data = df
         logger.info(f"Successfully parsed {len(df)} draws")
         
+        # Save to cache
+        self.save_cache()
+        
         return df
     
-    @ErrorHandler.handle_exception(logger, "number expansion", pd.DataFrame())
+    @ErrorHandler.handle_exception(logger, "data expansion", pd.DataFrame())
     def expand_numbers(self):
         """Expand main and bonus numbers into individual columns with enhanced metadata."""
         if self.data is None or self.data.empty:
             logger.error("No data available. Parse the file first.")
             return pd.DataFrame()
         
+        # Check cache first
+        if self.expanded_data is not None:
+            return self.expanded_data
+            
         df = self.data.copy()
         
         # Expand main numbers (1-50)
@@ -775,14 +1029,14 @@ class LotteryDataProcessor:
         df["day"] = df["date"].dt.day
         df["day_of_week_num"] = df["date"].dt.dayofweek
         
-        # Handle the isocalendar() approach
+        # Handle week of year consistently
         try:
             df["week_of_year"] = df["date"].dt.isocalendar().week
         except:
             try:
                 df["week_of_year"] = df["date"].dt.weekofyear
             except:
-                # Manual calculation for week of year
+                # Manual calculation as last resort
                 df["week_of_year"] = df["date"].apply(lambda x: x.isocalendar()[1])
         
         # Holiday seasons and special periods
@@ -797,11 +1051,19 @@ class LotteryDataProcessor:
         # Number range metrics
         df["main_number_range"] = df["main_numbers"].apply(lambda x: max(x) - min(x) if x else 0)
         df["main_number_sum"] = df["main_numbers"].apply(lambda x: sum(x) if x else 0)
+        df["main_number_mean"] = df["main_numbers"].apply(lambda x: np.mean(x) if x else 0)
         df["bonus_number_diff"] = df["bonus_numbers"].apply(lambda x: x[1] - x[0] if len(x) >= 2 else 0)
         
         # Distribution metrics
         df["main_even_count"] = df["main_numbers"].apply(lambda x: sum(1 for n in x if n % 2 == 0))
         df["main_odd_count"] = df["main_numbers"].apply(lambda x: sum(1 for n in x if n % 2 == 1))
+        
+        # Create one-hot encoding for main and bonus numbers
+        for i in range(1, MAIN_NUM_MAX + 1):
+            df[f'main_has_{i}'] = df['main_numbers'].apply(lambda x: 1 if i in x else 0)
+            
+        for i in range(1, BONUS_NUM_MAX + 1):
+            df[f'bonus_has_{i}'] = df['bonus_numbers'].apply(lambda x: 1 if i in x else 0)
         
         # Decade distribution (1-10, 11-20, etc.)
         for decade in range(5):
@@ -811,20 +1073,116 @@ class LotteryDataProcessor:
                 lambda x: sum(1 for n in x if start <= n <= end)
             )
         
+        # Calculate consecutive numbers
+        df["main_consecutive_count"] = df["main_numbers"].apply(
+            lambda x: sum(1 for i in range(len(x)-1) if sorted(x)[i+1] - sorted(x)[i] == 1)
+        )
+        
+        # Low/high distribution
+        df["main_low_count"] = df["main_numbers"].apply(lambda x: sum(1 for n in x if n <= 25))
+        df["main_high_count"] = df["main_numbers"].apply(lambda x: sum(1 for n in x if n > 25))
+        df["main_low_high_ratio"] = df["main_low_count"] / df["main_high_count"].replace(0, 0.5)
+        
+        # Cyclical encodings for temporal features
+        df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+        df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+        df['day_sin'] = np.sin(2 * np.pi * df['day'] / 31)
+        df['day_cos'] = np.cos(2 * np.pi * df['day'] / 31)
+        df['day_of_week_sin'] = np.sin(2 * np.pi * df['day_of_week_num'] / 7)
+        df['day_of_week_cos'] = np.cos(2 * np.pi * df['day_of_week_num'] / 7)
+        
         self.expanded_data = df
+        logger.info(f"Created expanded data with {df.shape[1]} columns")
+        
+        # Save to cache
+        self.save_cache()
+        
         return df
     
+    @ErrorHandler.handle_exception(logger, "feature engineering", pd.DataFrame())
     def create_features(self):
-        """Generate all features for lottery prediction."""
+        """Generate advanced features for lottery prediction."""
         if self.expanded_data is None or self.expanded_data.empty:
             self.expanded_data = self.expand_numbers()
             if self.expanded_data.empty:
                 return pd.DataFrame()
+        
+        # Check cache first
+        if self.features is not None:
+            return self.features
                 
         # Create feature engineering instance
-        self.feature_engineer = FeatureEngineering(self.expanded_data)
-        self.features = self.feature_engineer.create_enhanced_features()
+        feature_engineer = FeatureEngineering(self.expanded_data)
+        self.features = feature_engineer.create_enhanced_features()
+        
+        # Save to cache
+        self.save_cache()
+        
         return self.features
+    
+    def create_sequences(self):
+        """Create sequence data for transformer model."""
+        if self.expanded_data is None or self.expanded_data.empty:
+            self.expanded_data = self.expand_numbers()
+            if self.expanded_data.empty:
+                return None, None, None, None
+        
+        logger.info(f"Creating sequence data (length: {self.sequence_length})")
+        
+        df = self.expanded_data
+        
+        # Process in sliding windows
+        num_samples = len(df) - self.sequence_length
+        
+        if num_samples <= 0:
+            logger.error(f"Not enough data for sequence length {self.sequence_length}")
+            return None, None, None, None
+        
+        # Pre-allocate arrays for main and bonus sequences
+        main_sequences = np.zeros((num_samples, self.sequence_length, MAIN_NUM_MAX))
+        bonus_sequences = np.zeros((num_samples, self.sequence_length, BONUS_NUM_MAX))
+        
+        # Extract main and bonus columns more efficiently
+        main_cols = [f"main_{i+1}" for i in range(MAIN_NUM_COUNT)]
+        bonus_cols = [f"bonus_{i+1}" for i in range(BONUS_NUM_COUNT)]
+        
+        # Check for NaN values in columns
+        if df[main_cols + bonus_cols].isna().any().any():
+            logger.warning("NaN values detected in number columns. Filling with -1 for processing.")
+            df[main_cols + bonus_cols] = df[main_cols + bonus_cols].fillna(-1)
+        
+        # Process each window
+        for i in range(num_samples):
+            # Get the window of previous draws
+            window = df.iloc[i:i+self.sequence_length]
+            
+            # For each draw in the window
+            for j, (_, row) in enumerate(window.iterrows()):
+                # Convert main numbers to one-hot encoding
+                main_nums = np.array([row[col] for col in main_cols if not pd.isna(row[col])]).astype(int)
+                main_nums = main_nums[main_nums > 0] - 1  # Convert to 0-based indices
+                if len(main_nums) > 0:
+                    main_sequences[i, j, main_nums] = 1
+                
+                # Same for bonus numbers
+                bonus_nums = np.array([row[col] for col in bonus_cols if not pd.isna(row[col])]).astype(int)
+                bonus_nums = bonus_nums[bonus_nums > 0] - 1  # Convert to 0-based indices
+                if len(bonus_nums) > 0:
+                    bonus_sequences[i, j, bonus_nums] = 1
+        
+        # Create target variables (next draw's numbers)
+        # Subtract 1 from each number to use as index (0-49 for main, 0-11 for bonus)
+        y_main = np.array([
+            df.iloc[self.sequence_length:][f"main_{i+1}"].values - 1 for i in range(MAIN_NUM_COUNT)
+        ]).T
+        
+        y_bonus = np.array([
+            df.iloc[self.sequence_length:][f"bonus_{i+1}"].values - 1 for i in range(BONUS_NUM_COUNT)
+        ]).T
+        
+        logger.info(f"Created sequences: Main shape: {main_sequences.shape}, Bonus shape: {bonus_sequences.shape}")
+        
+        return main_sequences, bonus_sequences, y_main, y_bonus
 
 #######################
 # FEATURE ENGINEERING
@@ -867,82 +1225,52 @@ class FeatureEngineering:
         logger.info("Generating enhanced features for lottery prediction")
         
         # Generate all features in one efficient pass
-        feature_sets = self._create_all_feature_sets()
+        feature_sets = []
+        
+        # Time series features
+        ts_features = self._calculate_time_series_features()
+        feature_sets.append(ts_features)
+        
+        # Number relationships
+        relationship_features = self._calculate_number_relationships()
+        feature_sets.append(relationship_features)
+        
+        # Pattern features
+        pattern_features = self._calculate_pattern_features()
+        feature_sets.append(pattern_features)
+        
+        # Cyclical features
+        cyclical_features = self._calculate_cyclical_features()
+        feature_sets.append(cyclical_features)
+        
+        # Autocorrelation features
+        autocorr_features = self._calculate_autocorrelation_features()
+        feature_sets.append(autocorr_features)
+        
+        # Statistical features
+        stat_features = self._calculate_statistical_features()
+        feature_sets.append(stat_features)
         
         # Combine all feature sets
-        all_features = pd.concat(feature_sets, axis=1)
+        valid_feature_sets = [fs for fs in feature_sets if not fs.empty]
         
-        # Handle missing and infinite values
+        if not valid_feature_sets:
+            logger.error("No valid features could be generated")
+            return pd.DataFrame()
+            
+        all_features = pd.concat(valid_feature_sets, axis=1)
+        
+        # Handle missing values
         all_features = all_features.fillna(0)
-        all_features = self._fix_infinite_values(all_features)
+        
+        # Handle infinity values
+        all_features = all_features.replace([np.inf, -np.inf], 0)
         
         # Select top features to avoid feature explosion
         all_features = self._select_top_features(all_features)
         
         logger.info(f"Created {all_features.shape[1]} enhanced features")
         return all_features
-    
-    def _create_all_feature_sets(self):
-        """Create all feature sets in one function to avoid multiple passes."""
-        feature_sets = []
-        
-        # Calculate time series features with window-based metrics
-        ts_features = self._calculate_time_series_features()
-        feature_sets.append(ts_features)
-        
-        # Calculate number relationships
-        relationship_features = self._calculate_number_relationships()
-        feature_sets.append(relationship_features)
-        
-        # Calculate pattern features
-        pattern_features = self._calculate_pattern_features()
-        feature_sets.append(pattern_features)
-        
-        # Calculate cyclical time features
-        cyclical_features = self._calculate_cyclical_features()
-        feature_sets.append(cyclical_features)
-        
-        # Calculate auto-correlation features
-        autocorr_features = self._calculate_autocorrelation_features()
-        feature_sets.append(autocorr_features)
-        
-        # Enhanced statistical features
-        stat_features = self._calculate_statistical_features()
-        feature_sets.append(stat_features)
-        
-        return [df for df in feature_sets if not df.empty]
-    
-    def _fix_infinite_values(self, data_frame):
-        """Handle infinite or extremely large values in the DataFrame."""
-        try:
-            # Replace infinities with NaN
-            data_frame.replace([np.inf, -np.inf], np.nan, inplace=True)
-            
-            # Fill NaN values with 0
-            data_frame.fillna(0, inplace=True)
-            
-            # Clip extremely large values to a reasonable range
-            numeric_cols = data_frame.select_dtypes(include=[np.number]).columns
-            for col in numeric_cols:
-                try:
-                    # Use quantile-based clipping for more robust outlier handling
-                    q_lo = data_frame[col].quantile(0.01)
-                    q_hi = data_frame[col].quantile(0.99)
-                    
-                    # Use a more conservative approach for clipping
-                    range_val = q_hi - q_lo
-                    if range_val > 0:  # Prevent division by zero
-                        data_frame[col] = data_frame[col].clip(q_lo - 3*range_val, q_hi + 3*range_val)
-                except Exception as e:
-                    logger.warning(f"Error clipping values in column {col}: {e}")
-                    # If clipping fails, just continue
-                    continue
-            
-            return data_frame
-        except Exception as e:
-            logger.error(f"Error fixing infinite values: {e}")
-            # Return original DataFrame if fixing fails
-            return data_frame
     
     def _select_top_features(self, features, max_features=MAX_FEATURES):
         """Select top features based on variance and correlation."""
@@ -1117,10 +1445,15 @@ class FeatureEngineering:
                     # Keep zeros for failed calculations
                     continue
             
-            # Bonus numbers statistics
+            # Calculate statistics for bonus numbers
             if len(bonus_nums) >= BONUS_NUM_COUNT:
                 try:
-                    bonus_diff[i] = bonus_nums[1] - bonus_nums[0] if len(bonus_nums) > 1 else 0
+                    sorted_bonus_nums = np.sort(bonus_nums)
+                    
+                    # Store difference between bonus numbers
+                    if len(sorted_bonus_nums) >= 2:
+                        bonus_diff[i] = sorted_bonus_nums[1] - sorted_bonus_nums[0]
+                    
                     bonus_sum[i] = np.sum(bonus_nums)
                     bonus_mean[i] = np.mean(bonus_nums)
                     bonus_odd_count[i] = np.sum(bonus_nums % 2 == 1)
@@ -1222,7 +1555,8 @@ class FeatureEngineering:
                     # Add signature with draw index
                     signatures.append(hist_norm)
                     valid_indices.append(i)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Error calculating pattern features for row {i}: {e}")
                 continue
         
         # Create clusters of similar patterns if we have enough data
@@ -1247,7 +1581,8 @@ class FeatureEngineering:
                     # Save cluster information for later use
                     self.pattern_clusters = {
                         'kmeans': kmeans,
-                        'pca': pca
+                        'pca': pca,
+                        'valid_indices': valid_indices
                     }
                     
                     # Assign clusters and calculate distances
@@ -1260,13 +1595,25 @@ class FeatureEngineering:
                         pattern_distance[orig_idx] = dist / np.sqrt(n_components)  # Normalize by dimensionality
                 else:
                     # Just use simple clustering directly on signatures if dimensions not sufficient
-                    kmeans = KMeans(n_clusters=2, random_state=RANDOM_SEED, n_init=10)
-                    cluster_labels = kmeans.fit_predict(signatures_array)
+                    n_clusters = min(2, len(signatures) // 10 + 1)  # Ensure at least 1 cluster
+                    kmeans = KMeans(n_clusters=n_clusters, random_state=RANDOM_SEED, n_init=10)
                     
-                    for idx, (orig_idx, cluster) in enumerate(zip(valid_indices, cluster_labels)):
-                        pattern_cluster[orig_idx] = cluster
+                    if signatures_array.shape[0] > n_clusters:  # Ensure we have more samples than clusters
+                        cluster_labels = kmeans.fit_predict(signatures_array)
+                        
+                        # Save simple cluster model
+                        self.pattern_clusters = {
+                            'kmeans': kmeans,
+                            'pca': None,
+                            'valid_indices': valid_indices,
+                            'is_fallback': True
+                        }
+                        
+                        for idx, (orig_idx, cluster) in enumerate(zip(valid_indices, cluster_labels)):
+                            pattern_cluster[orig_idx] = cluster
             except Exception as e:
                 logger.warning(f"Pattern clustering failed: {e}")
+                logger.debug(traceback.format_exc())
         
         # Create the pattern feature DataFrame
         pattern_features = {
@@ -1518,11 +1865,11 @@ class FeatureEngineering:
         return stat_df
 
 #######################
-# TRANSFORMER MODEL COMPONENTS
+# MODEL COMPONENTS
 #######################
 
 class TransformerBlock(tf.keras.layers.Layer):
-    """Transformer block with multi-head attention and feed-forward network."""
+    """Enhanced transformer block with multi-head attention and feed-forward network."""
     
     def __init__(self, embed_dim, num_heads, ff_dim, dropout=DEFAULT_DROPOUT_RATE, 
                 use_residual=True, use_layer_scaling=True):
@@ -1659,83 +2006,154 @@ class PositionalEncoding(tf.keras.layers.Layer):
         seq_len = tf.shape(inputs)[1]
         return inputs + self.pos_encoding[:, :seq_len, :]
 
-#######################
-# MODEL ARCHITECTURE
-#######################
-
 class ModelBuilder:
     """Unified model building for lottery prediction models."""
     
     @staticmethod
     @ErrorHandler.handle_exception(logger, "model building")
-    def build_transformer_model(input_dim, seq_length, params, model_config):
+    def build_transformer_model(input_dim, seq_length, params, model_config, distribution_strategy=None):
         """Build transformer model for lottery number prediction with flexible configuration."""
-        # Extract model configuration
-        num_outputs = model_config['num_outputs'] 
-        output_size = model_config['output_size']
-        sequence_size = model_config['sequence_size']
-        name_prefix = model_config['name_prefix']
+        # Use provided strategy or get default
+        if distribution_strategy is None:
+            distribution_strategy = tf.distribute.get_strategy()  # Default strategy
         
-        # Extract parameters with defaults
-        l2_reg = params.get('l2_regularization', 0.0001)
-        use_residual = params.get('use_residual', True)
-        use_layer_scaling = params.get('use_layer_scaling', True)
-        model_type = params.get('model_type', 'transformer')
-        lstm_units = params.get('lstm_units', 32)
-        
-        # Input layers - ensure consistent naming
-        feature_input = Input(shape=(input_dim,), name=f"{name_prefix}_feature_input")
-        sequence_input = Input(shape=(seq_length, sequence_size), name=f"{name_prefix}_sequence_input")
-        
-        # Process feature input with regularization
-        x_features = Dense(
-            params.get('embed_dim', DEFAULT_EMBED_DIM), 
-            activation="gelu",
-            kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-        )(feature_input)
-        x_features = BatchNormalization()(x_features)
-        x_features = Dropout(params.get('dropout_rate', DEFAULT_DROPOUT_RATE))(x_features)
-        
-        x_features = Dense(
-            params.get('embed_dim', DEFAULT_EMBED_DIM) // 2, 
-            activation="gelu",
-            kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-        )(x_features)
-        
-        # Process sequence input based on model type
-        if model_type == 'transformer':
-            # Transformer-based architecture (default)
+        with distribution_strategy.scope():
+            # Extract model configuration
+            num_outputs = model_config['num_outputs'] 
+            output_size = model_config['output_size']
+            sequence_size = model_config['sequence_size']
+            name_prefix = model_config['name_prefix']
             
-            # Fix: Ensure conv_filters is at least 1
+            # Extract parameters with defaults
+            l2_reg = params.get('l2_regularization', 0.0001)
+            use_residual = params.get('use_residual', True)
+            use_layer_scaling = params.get('use_layer_scaling', True)
+            model_type = params.get('model_type', 'transformer')
+            lstm_units = params.get('lstm_units', 32)
+            
+            # Define conv_filters here to ensure it's always available
             conv_filters = max(1, params.get('conv_filters', DEFAULT_CONV_FILTERS))
             
-            # Optional convolutional layer for sequence processing
-            if conv_filters > 0:  # This check is redundant now but kept for clarity
+            # Input layers - use correct dimensions and log them for debugging
+            logger.info(f"Creating model with input dimensions: features={input_dim}, seq_length={seq_length}, sequence_size={sequence_size}")
+            feature_input = Input(shape=(input_dim,), name=f"{name_prefix}_feature_input")
+            sequence_input = Input(shape=(seq_length, sequence_size), name=f"{name_prefix}_sequence_input")
+            
+            # Process feature input
+            x_features = Dense(
+                params.get('embed_dim', DEFAULT_EMBED_DIM), 
+                activation="gelu",
+                kernel_regularizer=l2(l2_reg)
+            )(feature_input)
+            x_features = BatchNormalization()(x_features)
+            x_features = Dropout(params.get('dropout_rate', DEFAULT_DROPOUT_RATE))(x_features)
+            
+            x_features = Dense(
+                params.get('embed_dim', DEFAULT_EMBED_DIM) // 2, 
+                activation="gelu",
+                kernel_regularizer=l2(l2_reg)
+            )(x_features)
+            
+            # Process sequence input based on model type
+            if model_type == 'transformer':
+                # Optional convolutional layer for sequence processing
+                x_seq = Conv1D(
+                    conv_filters, 
+                    kernel_size=3, 
+                    padding='same', 
+                    activation="relu",
+                    kernel_regularizer=l2(l2_reg)
+                )(sequence_input)
+                x_seq = BatchNormalization()(x_seq)
+                    
+                # Embedding layer
+                x_seq = Dense(
+                    params.get('embed_dim', DEFAULT_EMBED_DIM),
+                    kernel_regularizer=l2(l2_reg)
+                )(x_seq)
+                
+                # Apply positional encoding
+                x_seq = PositionalEncoding(
+                    max_position=seq_length + 5,  # Add padding for safety
+                    d_model=params.get('embed_dim', DEFAULT_EMBED_DIM)
+                )(x_seq)
+                
+                # Apply transformer blocks
+                for _ in range(params.get('num_transformer_blocks', DEFAULT_TRANSFORMER_BLOCKS)):
+                    x_seq = TransformerBlock(
+                        embed_dim=params.get('embed_dim', DEFAULT_EMBED_DIM),
+                        num_heads=params.get('num_heads', DEFAULT_NUM_HEADS),
+                        ff_dim=params.get('ff_dim', DEFAULT_FF_DIM),
+                        dropout=params.get('dropout_rate', DEFAULT_DROPOUT_RATE),
+                        use_residual=use_residual,
+                        use_layer_scaling=use_layer_scaling
+                    )(x_seq)
+                
+                # Process sequence with GRU or global pooling
+                if params.get('use_gru', True):
+                    x_seq = Bidirectional(GRU(
+                        params.get('embed_dim', DEFAULT_EMBED_DIM) // 2, 
+                        return_sequences=False,
+                        kernel_regularizer=l2(l2_reg)
+                    ))(x_seq)
+                else:
+                    x_seq = GlobalAveragePooling1D()(x_seq)
+                        
+            elif model_type == 'lstm':
+                # LSTM-based architecture
                 x_seq = Conv1D(
                     conv_filters, 
                     kernel_size=3, 
                     padding='same', 
                     activation="gelu",
-                    kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
+                    kernel_regularizer=l2(l2_reg)
+                )(sequence_input)
+                
+                x_seq = BatchNormalization()(x_seq)
+                
+                # Bidirectional LSTM
+                x_seq = Bidirectional(LSTM(
+                    lstm_units,
+                    return_sequences=True,
+                    kernel_regularizer=l2(l2_reg),
+                    recurrent_regularizer=l2(l2_reg),
+                    dropout=params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * 0.5,
+                    recurrent_dropout=params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * 0.5
+                ))(x_seq)
+                
+                # Another LSTM layer
+                x_seq = LSTM(
+                    lstm_units,
+                    return_sequences=False,
+                    kernel_regularizer=l2(l2_reg),
+                    recurrent_regularizer=l2(l2_reg),
+                    dropout=params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * 0.5,
+                    recurrent_dropout=params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * 0.5
+                )(x_seq)
+            
+            elif model_type == 'hybrid':
+                # New hybrid architecture combining transformer and RNN elements
+                x_seq = Conv1D(
+                    conv_filters, 
+                    kernel_size=3, 
+                    padding='same', 
+                    activation="gelu",
+                    kernel_regularizer=l2(l2_reg)
                 )(sequence_input)
                 x_seq = BatchNormalization()(x_seq)
-            else:
-                x_seq = sequence_input
                     
-            # Embedding layer
-            x_seq = Dense(
-                params.get('embed_dim', DEFAULT_EMBED_DIM),
-                kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-            )(x_seq)
-            
-            # Apply positional encoding
-            x_seq = PositionalEncoding(
-                max_position=seq_length + 5,  # Add padding for safety
-                d_model=params.get('embed_dim', DEFAULT_EMBED_DIM)
-            )(x_seq)
-            
-            # Apply transformer blocks
-            for _ in range(params.get('num_transformer_blocks', DEFAULT_TRANSFORMER_BLOCKS)):
+                # First apply positional encoding
+                x_seq = Dense(
+                    params.get('embed_dim', DEFAULT_EMBED_DIM),
+                    kernel_regularizer=l2(l2_reg)
+                )(x_seq)
+                
+                x_seq = PositionalEncoding(
+                    max_position=seq_length + 5,
+                    d_model=params.get('embed_dim', DEFAULT_EMBED_DIM)
+                )(x_seq)
+                
+                # Apply transformer block
                 x_seq = TransformerBlock(
                     embed_dim=params.get('embed_dim', DEFAULT_EMBED_DIM),
                     num_heads=params.get('num_heads', DEFAULT_NUM_HEADS),
@@ -1744,577 +2162,1614 @@ class ModelBuilder:
                     use_residual=use_residual,
                     use_layer_scaling=use_layer_scaling
                 )(x_seq)
-            
-            # Process sequence with GRU or global pooling
-            if params.get('use_gru', True):
-                x_seq = Bidirectional(GRU(
-                    params.get('embed_dim', DEFAULT_EMBED_DIM) // 2, 
-                    return_sequences=False,
-                    kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-                ))(x_seq)
-            else:
+                
+                # Then process with LSTM or GRU
+                gru_units = params.get('gru_units', 32)
+                lstm_units = params.get('lstm_units', 32)
+                
+                # Split processing path
+                path1 = GRU(
+                    gru_units, 
+                    return_sequences=True,
+                    kernel_regularizer=l2(l2_reg)
+                )(x_seq)
+                
+                path2 = LSTM(
+                    lstm_units, 
+                    return_sequences=True,
+                    kernel_regularizer=l2(l2_reg)
+                )(x_seq)
+                
+                # Combine paths
+                x_seq = Concatenate()([path1, path2])
+                
+                # Final sequence processing
                 x_seq = GlobalAveragePooling1D()(x_seq)
-                    
-        elif model_type == 'lstm':
-            # LSTM-based architecture
-            # Fix: Ensure conv_filters is at least 1
-            conv_filters = max(1, params.get('conv_filters', DEFAULT_CONV_FILTERS))
+                
+            elif model_type == 'rnn':
+                # Simple RNN architecture
+                x_seq = SimpleRNN(
+                    params.get('embed_dim', DEFAULT_EMBED_DIM),
+                    return_sequences=True,
+                    kernel_regularizer=l2(l2_reg)
+                )(sequence_input)
+                
+                x_seq = Dropout(params.get('dropout_rate', DEFAULT_DROPOUT_RATE))(x_seq)
+                
+                x_seq = SimpleRNN(
+                    params.get('embed_dim', DEFAULT_EMBED_DIM) // 2,
+                    return_sequences=False,
+                    kernel_regularizer=l2(l2_reg)
+                )(x_seq)
             
-            x_seq = Conv1D(
-                conv_filters, 
-                kernel_size=3, 
-                padding='same', 
+            else:
+                # Fallback to CNN architecture
+                x_seq = Conv1D(
+                    conv_filters * 2, 
+                    kernel_size=5, 
+                    padding='same', 
+                    activation="relu",
+                    kernel_regularizer=l2(l2_reg)
+                )(sequence_input)
+                
+                x_seq = BatchNormalization()(x_seq)
+                x_seq = Dropout(params.get('dropout_rate', DEFAULT_DROPOUT_RATE))(x_seq)
+                
+                x_seq = Conv1D(
+                    conv_filters, 
+                    kernel_size=3, 
+                    padding='same', 
+                    activation="relu",
+                    kernel_regularizer=l2(l2_reg)
+                )(x_seq)
+                
+                x_seq = GlobalAveragePooling1D()(x_seq)
+            
+            # Combine feature and sequence representations
+            combined = Concatenate()([x_features, x_seq])
+            
+            # Dense layers
+            combined = Dense(
+                params.get('ff_dim', DEFAULT_FF_DIM), 
                 activation="gelu",
-                kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-            )(sequence_input)
-            
-            x_seq = BatchNormalization()(x_seq)
-            
-            # Bidirectional LSTM
-            x_seq = Bidirectional(LSTM(
-                lstm_units,
-                return_sequences=True,
-                kernel_regularizer=tf.keras.regularizers.l2(l2_reg),
-                recurrent_regularizer=tf.keras.regularizers.l2(l2_reg),
-                dropout=params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * 0.5,
-                recurrent_dropout=params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * 0.5
-            ))(x_seq)
-            
-            # Another LSTM layer
-            x_seq = LSTM(
-                lstm_units,
-                return_sequences=False,
-                kernel_regularizer=tf.keras.regularizers.l2(l2_reg),
-                recurrent_regularizer=tf.keras.regularizers.l2(l2_reg),
-                dropout=params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * 0.5,
-                recurrent_dropout=params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * 0.5
-            )(x_seq)
-            
-        elif model_type == 'rnn':
-            # Simple RNN architecture (lighter weight)
-            x_seq = SimpleRNN(
-                params.get('embed_dim', DEFAULT_EMBED_DIM),
-                return_sequences=True,
-                kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-            )(sequence_input)
-            
-            x_seq = Dropout(params.get('dropout_rate', DEFAULT_DROPOUT_RATE))(x_seq)
-            
-            x_seq = SimpleRNN(
-                params.get('embed_dim', DEFAULT_EMBED_DIM) // 2,
-                return_sequences=False,
-                kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-            )(x_seq)
-        
-        else:
-            # Fallback to CNN architecture
-            # Fix: Ensure conv_filters is at least 1
-            conv_filters = max(1, params.get('conv_filters', DEFAULT_CONV_FILTERS))
-            
-            x_seq = Conv1D(
-                conv_filters * 2, 
-                kernel_size=5, 
-                padding='same', 
-                activation="gelu",
-                kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-            )(sequence_input)
-            
-            x_seq = BatchNormalization()(x_seq)
-            x_seq = Dropout(params.get('dropout_rate', DEFAULT_DROPOUT_RATE))(x_seq)
-            
-            x_seq = Conv1D(
-                conv_filters, 
-                kernel_size=3, 
-                padding='same', 
-                activation="gelu",
-                kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-            )(x_seq)
-            
-            x_seq = GlobalAveragePooling1D()(x_seq)
-        
-        # Combine feature and sequence representations
-        combined = Concatenate()([x_features, x_seq])
-        
-        # Dense layers for combined processing with regularization
-        combined = Dense(
-            params.get('ff_dim', DEFAULT_FF_DIM), 
-            activation="gelu",
-            kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-        )(combined)
-        combined = BatchNormalization()(combined)
-        combined = Dropout(params.get('dropout_rate', DEFAULT_DROPOUT_RATE))(combined)
-        
-        combined = Dense(
-            params.get('ff_dim', DEFAULT_FF_DIM) // 2, 
-            activation="gelu",
-            kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-        )(combined)
-        combined = Dropout(params.get('dropout_rate', DEFAULT_DROPOUT_RATE) / 2)(combined)
-        
-        # Output layers (one for each position)
-        outputs = []
-        for i in range(num_outputs):
-            # Position-specific processing
-            position_specific = Dense(
-                params.get('ff_dim', DEFAULT_FF_DIM) // 4, 
-                activation="gelu",
-                kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
+                kernel_regularizer=l2(l2_reg)
             )(combined)
+            combined = BatchNormalization()(combined)
+            combined = Dropout(params.get('dropout_rate', DEFAULT_DROPOUT_RATE))(combined)
             
-            logits = Dense(
-                output_size, 
-                activation=None, 
-                name=f"{name_prefix}_logits_{i+1}",
-                kernel_regularizer=tf.keras.regularizers.l2(l2_reg)
-            )(position_specific)
+            combined = Dense(
+                params.get('ff_dim', DEFAULT_FF_DIM) // 2, 
+                activation="gelu",
+                kernel_regularizer=l2(l2_reg)
+            )(combined)
+            combined = Dropout(params.get('dropout_rate', DEFAULT_DROPOUT_RATE) / 2)(combined)
             
-            output = Activation('softmax', name=f"{name_prefix}_{i+1}")(logits)
-            outputs.append(output)
-        
-        # Create model with explicit list inputs
-        model = Model(inputs=[feature_input, sequence_input], outputs=outputs)
-        
-        # Compile model with metrics
-        metrics_dict = {f"{name_prefix}_{i+1}": "accuracy" for i in range(num_outputs)}
-        
-        # Configure optimizer
-        optimizer_name = params.get('optimizer', 'adam').lower()
-        learning_rate = params.get('learning_rate', DEFAULT_LEARNING_RATE)
-        
-        if optimizer_name == 'adam':
-            optimizer = Adam(learning_rate=learning_rate)
-        elif optimizer_name == 'sgd':
-            optimizer = SGD(learning_rate=learning_rate, momentum=0.9)
-        elif optimizer_name == 'rmsprop':
-            optimizer = RMSprop(learning_rate=learning_rate)
-        else:
-            optimizer = Adam(learning_rate=learning_rate)
-        
-        model.compile(
-            optimizer=optimizer,
-            loss="sparse_categorical_crossentropy",
-            metrics=metrics_dict
-        )
-        
-        return model
+            # Output layers (one for each position)
+            outputs = []
+            for i in range(num_outputs):
+                # Position-specific processing
+                position_specific = Dense(
+                    params.get('ff_dim', DEFAULT_FF_DIM) // 4, 
+                    activation="gelu",
+                    kernel_regularizer=l2(l2_reg)
+                )(combined)
+                
+                # Logits
+                logits = Dense(
+                    output_size, 
+                    activation=None, 
+                    name=f"{name_prefix}_logits_{i+1}",
+                    kernel_regularizer=l2(l2_reg)
+                )(position_specific)
+                
+                # Apply softmax activation
+                output = Activation('softmax', name=f"{name_prefix}_{i+1}")(logits)
+                outputs.append(output)
+            
+            # Create model
+            model = Model(inputs=[feature_input, sequence_input], outputs=outputs)
+            
+            # Configure metrics
+            metrics_dict = {f"{name_prefix}_{i+1}": "accuracy" for i in range(num_outputs)}
+            
+            # Configure optimizer
+            optimizer_name = params.get('optimizer', 'adam').lower()
+            learning_rate = params.get('learning_rate', DEFAULT_LEARNING_RATE)
+
+            if optimizer_name == 'adam':
+                optimizer = Adam(learning_rate=learning_rate)
+            elif optimizer_name == 'sgd':
+                optimizer = SGD(learning_rate=learning_rate, momentum=0.9)
+            elif optimizer_name == 'rmsprop':
+                optimizer = RMSprop(learning_rate=learning_rate)
+            elif optimizer_name == 'adamw':
+                # Add support for AdamW optimizer
+                from tensorflow.keras.optimizers import Adam
+                # Some versions of TF don't have AdamW directly
+                try:
+                    from tensorflow.keras.optimizers import AdamW
+                    optimizer = AdamW(learning_rate=learning_rate, weight_decay=0.01)
+                except ImportError:
+                    # Fallback to Adam with L2 regularization if AdamW not available
+                    logger.warning("AdamW optimizer not available, falling back to Adam")
+                    optimizer = Adam(learning_rate=learning_rate)
+            else:
+                optimizer = Adam(learning_rate=learning_rate)
+
+            # Create loss dictionary - one entry per output
+            loss_dict = {f"{name_prefix}_{i+1}": "sparse_categorical_crossentropy" for i in range(num_outputs)}
+
+            # Compile model
+            model.compile(
+                optimizer=optimizer,
+                loss=loss_dict,
+                metrics=metrics_dict
+            )
+
+            return model
 
 #######################
-# LOTTERY PREDICTOR
+# NEURAL NETWORK MODELS
 #######################
 
-class LotteryModel:
-    """Unified model for lottery prediction."""
+class TransformerModel:
+    """Neural sequence model for lottery prediction."""
     
-    def __init__(self, params=None):
-        """Initialize the lottery model."""
-        # Default parameters
-        self.params = Utilities.get_default_params() if params is None else params
-        self.main_model = None
-        self.bonus_model = None
+    def __init__(self, input_shape, output_dim, params=None, distribution_strategy=None):
+        """
+        Initialize the sequence model with proper shape handling and distribution strategy.
         
-    def build_models(self, input_dim, seq_length):
-        """Build both main and bonus number models using the same framework."""
-        # Define model configurations
-        main_config = {
+        Args:
+            input_shape: Tuple of (feature_dim, sequence_dim)
+            output_dim: Output dimension (usually MAIN_NUM_MAX)
+            params: Dictionary of model parameters
+            distribution_strategy: TensorFlow distribution strategy for multi-GPU training
+        """
+        self.input_shape = input_shape
+        self.seq_dim = input_shape[1]  # Store sequence dimension for clarity
+        self.features_dim = input_shape[0]  # Store feature dimension
+        self.output_dim = output_dim
+        self.params = params or Utilities.get_default_params()
+        self.model = None
+        self.history = None
+        self.checkpoint_path = os.path.join(MODEL_DIR, "transformer_model.keras")
+        self.distribution_strategy = distribution_strategy or tf.distribute.get_strategy()
+    
+    def build_model(self):
+        """Build neural sequence model with transformer architecture."""
+        # Configure model - explicitly use the dimensions from initialization
+        model_config = {
             'num_outputs': MAIN_NUM_COUNT,
-            'output_size': MAIN_NUM_MAX,
-            'sequence_size': MAIN_NUM_MAX,
-            'name_prefix': 'main'
+            'output_size': self.output_dim,
+            'sequence_size': self.seq_dim,  # Use stored sequence dimension
+            'name_prefix': 'transformer'
         }
         
-        bonus_config = {
-            'num_outputs': BONUS_NUM_COUNT,
-            'output_size': BONUS_NUM_MAX,
-            'sequence_size': BONUS_NUM_MAX,
-            'name_prefix': 'bonus'
-        }
+        # Ensure sequence_length is set correctly from params
+        seq_length = self.params.get('sequence_length', DEFAULT_SEQUENCE_LENGTH)
         
-        # Build models with shared architecture but different configurations
-        self.main_model = ModelBuilder.build_transformer_model(
-            input_dim=input_dim,
+        # Log the dimensions being used to build the model
+        logger.info(f"Building transformer model with dimensions: features={self.features_dim}, sequence_length={seq_length}, sequence_size={self.seq_dim}")
+        
+        # Build model with the correct dimensions and distribution strategy
+        self.model = ModelBuilder.build_transformer_model(
+            input_dim=self.features_dim,
             seq_length=seq_length,
             params=self.params,
-            model_config=main_config
+            model_config=model_config,
+            distribution_strategy=self.distribution_strategy
         )
         
-        self.bonus_model = ModelBuilder.build_transformer_model(
-            input_dim=input_dim,
-            seq_length=seq_length,
-            params=self.params,
-            model_config=bonus_config
-        )
-        
-        logger.info("Built transformer models for main and bonus numbers")
-        return self.main_model, self.bonus_model
+        return self.model
     
-    @ErrorHandler.handle_exception(logger, "model training")
-    def train_models(self, X_train, main_seq_train, bonus_seq_train, 
-                    y_main_train, y_bonus_train, validation_split=0.1, 
-                    epochs=None, batch_size=None):
-        """Train both models with unified approach."""
-        if self.main_model is None or self.bonus_model is None:
-            raise ValueError("Models not built. Call build_models() first.")
+    def _load_best_weights(self):
+        """Helper method to load the best weights after training."""
+        if self.checkpoint_path and os.path.exists(self.checkpoint_path):
+            try:
+                logger.info(f"Loading best weights from {self.checkpoint_path}")
+                self.model.load_weights(self.checkpoint_path)
+                logger.info("Successfully loaded best weights")
+                return True
+            except Exception as e:
+                logger.warning(f"Could not load weights from checkpoint: {e}")
+                logger.warning("Using current model weights instead (from EarlyStopping callback)")
+                
+                # In case the checkpoint file is corrupted, try to remove it
+                try:
+                    os.remove(self.checkpoint_path)
+                    logger.info(f"Removed potentially corrupted checkpoint file: {self.checkpoint_path}")
+                except:
+                    pass
+        else:
+            logger.info("No checkpoint file found. Using weights from EarlyStopping callback.")
+        
+        return False
+    
+    @ErrorHandler.handle_exception(logger, "transformer model training")
+    def train(self, X_train, y_train, validation_split=0.2, epochs=None, batch_size=None):
+        """Train the model with early stopping and learning rate scheduling."""
+        if self.model is None:
+            raise ValueError("Model not built. Call build_model() first.")
         
         # Use parameter values or defaults
         actual_epochs = epochs if epochs is not None else self.params.get('epochs', DEFAULT_EPOCHS)
-        actual_batch_size = batch_size if batch_size is not None else self.params.get('batch_size', DEFAULT_BATCH_SIZE)
-        min_delta = self.params.get('min_delta', MIN_DELTA)
+        base_batch_size = batch_size if batch_size is not None else self.params.get('batch_size', DEFAULT_BATCH_SIZE)
         
-        # Get callbacks for both models at once
-        callbacks_dict, _ = Utilities.get_model_callbacks(
-            model_types=["main", "bonus"], 
+        # Scale batch size by number of replicas (GPUs)
+        num_replicas = self.distribution_strategy.num_replicas_in_sync
+        scaled_batch_size = base_batch_size * num_replicas
+        logger.info(f"Scaling batch size from {base_batch_size} to {scaled_batch_size} for {num_replicas} GPU(s)")
+        
+        # Get callbacks
+        callbacks, self.checkpoint_path = Utilities.get_model_callbacks(
+            model_types="transformer",
             patience=DEFAULT_PATIENCE,
-            min_delta=min_delta
+            min_delta=self.params.get('min_delta', MIN_DELTA)
         )
         
-        # Flatten target arrays
-        y_main_train_flat = [y_main_train[:, j].flatten() for j in range(MAIN_NUM_COUNT)]
+        # Ensure inputs are properly formatted
+        if isinstance(X_train, tuple) and len(X_train) == 2:
+            X_features, X_sequences = X_train
+        else:
+            X_features = X_train[0]
+            X_sequences = X_train[1]
         
-        # Ensure inputs are numpy arrays with correct type
-        X_train_arr = np.asarray(X_train)
-        main_seq_train_arr = np.asarray(main_seq_train)
+        # Verify and log data shapes
+        logger.info(f"Initial data shapes: X_features={X_features.shape}, X_sequences={X_sequences.shape}")
+        if isinstance(y_train, np.ndarray):
+            logger.info(f"y_train shape: {y_train.shape}")
+        elif isinstance(y_train, list) and len(y_train) > 0:
+            logger.info(f"y_train is a list with {len(y_train)} elements. First element shape: {y_train[0].shape}")
+            
+        # Ensure all arrays have the same number of samples
+        if X_features.shape[0] != X_sequences.shape[0]:
+            min_samples = min(X_features.shape[0], X_sequences.shape[0])
+            logger.warning(f"Input arrays have different sizes. Truncating to {min_samples} samples.")
+            X_features = X_features[:min_samples]
+            X_sequences = X_sequences[:min_samples]
         
-        # Train main model with explicitly formatted inputs
-        logger.info("Training main numbers model")
-        main_history = self.main_model.fit(
-            [X_train_arr, main_seq_train_arr],  # Pass as list instead of dict
-            y_main_train_flat,
-            epochs=actual_epochs,
-            batch_size=actual_batch_size,
-            validation_split=validation_split,
-            callbacks=callbacks_dict["main"],
-            verbose=1
-        )
+        # Format y_train for multi-output model
+        if isinstance(y_train, np.ndarray) and len(y_train.shape) == 2:
+            # Ensure y_train has the right number of samples
+            if y_train.shape[0] != X_features.shape[0]:
+                min_samples = min(y_train.shape[0], X_features.shape[0])
+                logger.warning(f"Target and input arrays have different sizes. Truncating all to {min_samples} samples.")
+                X_features = X_features[:min_samples]
+                X_sequences = X_sequences[:min_samples]
+                y_train = y_train[:min_samples]
+                
+            # Convert 2D array to list of arrays, one for each output
+            y_train_formatted = [y_train[:, i] for i in range(y_train.shape[1])]
+        else:
+            # If y_train is already a list of arrays
+            y_train_formatted = y_train
+            
+            # Check if the first element has the right shape
+            if isinstance(y_train_formatted, list) and len(y_train_formatted) > 0:
+                first_y = y_train_formatted[0]
+                if first_y.shape[0] != X_features.shape[0]:
+                    min_samples = min(first_y.shape[0], X_features.shape[0])
+                    logger.warning(f"Target and input arrays have different sizes. Truncating all to {min_samples} samples.")
+                    X_features = X_features[:min_samples]
+                    X_sequences = X_sequences[:min_samples]
+                    y_train_formatted = [y[:min_samples] for y in y_train_formatted]
         
-        # Save training history
-        try:
-            with open("main_model_history.json", "w") as f:
-                json.dump({
-                    "loss": [float(x) for x in main_history.history["loss"]],
-                    "val_loss": [float(x) for x in main_history.history["val_loss"]]
-                }, f, indent=4)
-        except Exception as e:
-            logger.warning(f"Could not save main model history: {e}")
+        # Log final data shapes after adjustments
+        logger.info(f"Final data shapes: X_features={X_features.shape}, X_sequences={X_sequences.shape}")
+        if isinstance(y_train_formatted, list) and len(y_train_formatted) > 0:
+            logger.info(f"y_train_formatted first element shape: {y_train_formatted[0].shape}")
         
-        # Clean memory before training bonus model
-        Utilities.clean_memory()
+        # Create our own train/validation split to ensure consistency
+        if validation_split > 0:
+            split_idx = int(X_features.shape[0] * (1 - validation_split))
+            
+            # Training data
+            X_train_features = X_features[:split_idx]
+            X_train_sequences = X_sequences[:split_idx]
+            y_train_formatted_split = [y[:split_idx] for y in y_train_formatted]
+            
+            # Validation data
+            X_val_features = X_features[split_idx:]
+            X_val_sequences = X_sequences[split_idx:]
+            y_val_formatted = [y[split_idx:] for y in y_train_formatted]
+            
+            logger.info(f"Created manual train/validation split: {split_idx} training samples, "
+                    f"{X_features.shape[0] - split_idx} validation samples")
+            
+            # Train with manual validation data
+            self.history = self.model.fit(
+                [X_train_features, X_train_sequences],
+                y_train_formatted_split,
+                epochs=actual_epochs,
+                batch_size=scaled_batch_size,
+                validation_data=([X_val_features, X_val_sequences], y_val_formatted),
+                callbacks=callbacks,
+                verbose=1
+            )
+        else:
+            # Train without validation
+            self.history = self.model.fit(
+                [X_features, X_sequences],
+                y_train_formatted,
+                epochs=actual_epochs,
+                batch_size=scaled_batch_size,
+                callbacks=callbacks,
+                verbose=1
+            )
         
-        # Flatten bonus target arrays
-        y_bonus_train_flat = [y_bonus_train[:, j].flatten() for j in range(BONUS_NUM_COUNT)]
+        self._load_best_weights()
+                    
+        # We're relying on EarlyStopping callback's restore_best_weights=True as backup
+        logger.info("Training completed. Model is using the weights from best validation loss.")
         
-        # Ensure bonus inputs are numpy arrays
-        bonus_seq_train_arr = np.asarray(bonus_seq_train)
-        
-        # Train bonus model with explicitly formatted inputs
-        logger.info("Training bonus numbers model")
-        bonus_history = self.bonus_model.fit(
-            [X_train_arr, bonus_seq_train_arr],  # Pass as list instead of dict
-            y_bonus_train_flat,
-            epochs=actual_epochs,
-            batch_size=actual_batch_size,
-            validation_split=validation_split,
-            callbacks=callbacks_dict["bonus"],
-            verbose=1
-        )
-        
-        # Save training history
-        try:
-            with open("bonus_model_history.json", "w") as f:
-                json.dump({
-                    "loss": [float(x) for x in bonus_history.history["loss"]],
-                    "val_loss": [float(x) for x in bonus_history.history["val_loss"]]
-                }, f, indent=4)
-        except Exception as e:
-            logger.warning(f"Could not save bonus model history: {e}")
-        
-        # Clean memory after training
-        Utilities.clean_memory(force=True)
-        
-        return {"main": main_history, "bonus": bonus_history}
+        return self.history
     
-    @ErrorHandler.handle_exception(logger, "prediction", [])
-    def predict(self, features, main_sequence, bonus_sequence, num_draws=5, 
-            temperature=DEFAULT_TEMPERATURE, diversity_sampling=True):
-        """Generate predictions using the model."""
-        if self.main_model is None or self.bonus_model is None:
-            raise ValueError("Models not trained. Train models first.")
+    def predict(self, X):
+        """Generate predictions for input data."""
+        if self.model is None:
+            raise ValueError("Model not trained")
+            
+        # Ensure X is in the right format
+        if isinstance(X, tuple) and len(X) == 2:
+            return self.model.predict(X, verbose=0)
+        elif isinstance(X, list) and len(X) == 2:
+            return self.model.predict(X, verbose=0)
+        else:
+            raise ValueError("Input must be a tuple or list of (features, sequences)")
+    
+    def save(self, path=None):
+        """Save model to disk."""
+        if self.model is None:
+            raise ValueError("No model to save")
+            
+        save_path = path or self.checkpoint_path
+        self.model.save(save_path)
+        logger.info(f"Model saved to {save_path}")
         
-        # Ensure inputs are numpy arrays
-        features_arr = np.asarray(features)
-        main_sequence_arr = np.asarray(main_sequence)
-        bonus_sequence_arr = np.asarray(bonus_sequence)
-        
-        # Track used numbers for diversity
-        used_main_numbers = set()
-        used_bonus_numbers = set()
-        
-        # Generate predictions
-        predictions = []
-        
-        for draw_idx in range(num_draws):
-            # Predict main numbers with explicit list inputs
-            main_probs = self.main_model.predict([features_arr, main_sequence_arr], verbose=0)
-            
-            # Predict bonus numbers with explicit list inputs
-            bonus_probs = self.bonus_model.predict([features_arr, bonus_sequence_arr], verbose=0)
-            
-            # Calculate confidence scores for dynamic temperature
-            main_confidence = np.mean([np.max(main_probs[i][0]) for i in range(MAIN_NUM_COUNT)])
-            bonus_confidence = np.mean([np.max(bonus_probs[i][0]) for i in range(BONUS_NUM_COUNT)])
-            
-            # Calculate overall confidence for temperature adjustment
-            overall_confidence = (main_confidence + bonus_confidence) / 2
-            
-            # Apply dynamic temperature based on confidence
-            dynamic_temp = Utilities.calculate_dynamic_temperature(overall_confidence, 
-                                                                min_temp=MIN_TEMPERATURE,
-                                                                max_temp=MAX_TEMPERATURE)
-            
-            # Use original temperature for first draw, then use dynamic temperature
-            actual_temp = temperature if draw_idx == 0 else dynamic_temp
-            
-            # Log temperature adjustment for debugging
-            if draw_idx > 0 and abs(actual_temp - temperature) > 0.1:
-                logger.info(f"Dynamic temperature adjustment: {temperature} -> {actual_temp} (confidence: {overall_confidence:.4f})")
-            
-            # Sample main numbers
-            main_numbers = Utilities.sample_numbers(
-                probs=main_probs,
-                available_nums=range(MAIN_NUM_MIN, MAIN_NUM_MAX+1),
-                num_to_select=MAIN_NUM_COUNT,
-                used_nums=used_main_numbers,
-                diversity_sampling=diversity_sampling,
-                draw_idx=draw_idx,
-                temperature=actual_temp,
-                confidence=overall_confidence
+    def load(self, path=None):
+        """Load model from disk."""
+        load_path = path or self.checkpoint_path
+        if os.path.exists(load_path):
+            self.model = tf.keras.models.load_model(load_path)
+            logger.info(f"Model loaded from {load_path}")
+            return True
+        else:
+            logger.warning(f"No saved model found at {load_path}")
+            return False
+
+class FrequencyModel:
+    """Frequency-based prediction model."""
+    
+    def __init__(self, n_estimators=200, learning_rate=0.05, max_depth=5):
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.max_depth = max_depth
+        self.models = []  # One model per position
+        self.feature_importances = []
+        self.checkpoint_path = os.path.join(MODEL_DIR, "frequency_model.pkl")
+    
+    def build_model(self, n_positions=MAIN_NUM_COUNT):
+        """Build frequency models for each position."""
+        for pos in range(n_positions):
+            model = GradientBoostingRegressor(
+                n_estimators=self.n_estimators,
+                learning_rate=self.learning_rate,
+                max_depth=self.max_depth,
+                random_state=RANDOM_SEED,
+                validation_fraction=0.2,
+                n_iter_no_change=15,
+                tol=0.0005
             )
+            self.models.append(model)
+        
+        return self.models
+    
+    @ErrorHandler.handle_exception(logger, "frequency model training")
+    def train(self, X_train, y_train_raw):
+        """Train frequency model for each position in the draw."""
+        if not self.models:
+            raise ValueError("Models not built. Call build_model() first.")
+        
+        # Train a separate model for each position
+        for pos in range(len(self.models)):
+            # Extract target for this position
+            y_pos = np.array([draw[pos] for draw in y_train_raw])
             
-            # Sample bonus numbers
-            bonus_numbers = Utilities.sample_numbers(
-                probs=bonus_probs,
-                available_nums=range(BONUS_NUM_MIN, BONUS_NUM_MAX+1),
-                num_to_select=BONUS_NUM_COUNT,
-                used_nums=used_bonus_numbers,
-                diversity_sampling=diversity_sampling,
-                draw_idx=draw_idx,
-                temperature=actual_temp,
-                confidence=overall_confidence
-            )
+            # Train model
+            self.models[pos].fit(X_train, y_pos)
             
-            # Store position information for evaluation metrics
-            main_positions = {num: idx for idx, num in enumerate(main_numbers)}
+            # Store feature importances
+            self.feature_importances.append(self.models[pos].feature_importances_)
             
-            # Calibrate confidence scores with improved calibration
-            calibrated_main_conf = MAIN_CONF_SCALE * main_confidence + MAIN_CONF_OFFSET
-            calibrated_bonus_conf = BONUS_CONF_SCALE * bonus_confidence + BONUS_CONF_OFFSET
-            overall_confidence = (calibrated_main_conf + calibrated_bonus_conf) / 2
+        # Save the trained model
+        self.save()
+        
+        return self.models
+    
+    def predict(self, X):
+        """Generate predictions for each position."""
+        if not self.models:
+            raise ValueError("Models not trained")
             
-            predictions.append({
-                "main_numbers": main_numbers,
-                "main_number_positions": main_positions,
-                "bonus_numbers": bonus_numbers,
-                "confidence": {
-                    "overall": float(overall_confidence),
-                    "main_numbers": float(calibrated_main_conf),
-                    "bonus_numbers": float(calibrated_bonus_conf)
-                },
-                "method": "transformer",
-                "temperature": float(actual_temp)
+        # Predict for each position
+        position_predictions = []
+        
+        for model in self.models:
+            pred = model.predict(X)
+            position_predictions.append(pred)
+            
+        return np.array(position_predictions).T
+    
+    def predict_probabilities(self, X, num_range=MAIN_NUM_MAX):
+        """Convert predictions to probability distribution over all numbers."""
+        position_preds = self.predict(X)
+        
+        # Create probability matrix for each number
+        probabilities = np.zeros((len(X), num_range))
+        
+        for i, preds in enumerate(position_preds):
+            # For each prediction, create a Gaussian probability distribution
+            for pos, pred_num in enumerate(preds):
+                # Center of distribution is the predicted number
+                center = int(round(pred_num)) - 1  # Convert to 0-indexed
+                
+                # Ensure center is within bounds
+                center = max(0, min(center, num_range - 1))
+                
+                # Create Gaussian distribution around predicted number
+                for j in range(num_range):
+                    # Distance from prediction center
+                    dist = min(abs(j - center), num_range - abs(j - center))
+                    # Add probability mass inversely proportional to distance
+                    # Use a spreading factor that depends on position
+                    spread = 2.0 + pos * 0.5  # Positions later in draw have wider spread
+                    probabilities[i, j] += np.exp(-0.5 * (dist/spread)**2)
+        
+        # Normalize probabilities
+        row_sums = probabilities.sum(axis=1, keepdims=True)
+        probabilities = probabilities / row_sums
+        
+        return probabilities
+    
+    def get_top_features(self, n=10):
+        """Get top n most important features for each position."""
+        if not self.feature_importances:
+            raise ValueError("No feature importances available. Train model first.")
+            
+        top_features = []
+        
+        for pos, importances in enumerate(self.feature_importances):
+            # Get feature indices sorted by importance
+            sorted_idx = np.argsort(importances)[::-1]
+            
+            # Get top n features
+            top_n = sorted_idx[:n]
+            
+            top_features.append({
+                'position': pos,
+                'indices': top_n,
+                'importances': importances[top_n]
             })
             
-            # Clean memory less often - only every CLEAN_MEMORY_FREQUENCY predictions
-            if draw_idx > 0 and (draw_idx % CLEAN_MEMORY_FREQUENCY) == 0:
-                Utilities.clean_memory()
+        return top_features
+    
+    def save(self, path=None):
+        """Save models to disk."""
+        if not self.models:
+            raise ValueError("No models to save")
+            
+        save_path = path or self.checkpoint_path
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
+        data_to_save = {
+            'models': self.models,
+            'feature_importances': self.feature_importances
+        }
+        
+        with open(save_path, 'wb') as f:
+            import pickle
+            pickle.dump(data_to_save, f)
+            
+        logger.info(f"Frequency models saved to {save_path}")
+        
+    def load(self, path=None):
+        """Load models from disk with enhanced error handling."""
+        load_path = path or self.checkpoint_path
+        
+        if os.path.exists(load_path):
+            try:
+                with open(load_path, 'rb') as f:
+                    import pickle
+                    data = pickle.load(f)
+                    
+                # Validate the loaded data has the expected structure
+                if not isinstance(data, dict) or 'models' not in data or 'feature_importances' not in data:
+                    logger.error(f"Invalid frequency model format in {load_path}")
+                    return False
+                    
+                self.models = data['models']
+                self.feature_importances = data['feature_importances']
+                
+                # Verify models are valid
+                if not all(hasattr(model, 'predict') for model in self.models):
+                    logger.error(f"Loaded frequency models are not valid")
+                    return False
+                    
+                logger.info(f"Frequency models loaded from {load_path}")
+                return True
+            except Exception as e:
+                logger.error(f"Error loading frequency models: {e}")
+                logger.error(traceback.format_exc())
+                return False
+        else:
+            logger.warning(f"No saved models found at {load_path}")
+            return False
+
+class PatternModel:
+    """Pattern recognition model for lottery numbers."""
+    
+    def __init__(self, n_estimators=150, num_range=MAIN_NUM_MAX):
+        self.n_estimators = n_estimators
+        self.num_range = num_range
+        self.models = {}  # One model per number
+        self.feature_importances = {}
+        self.checkpoint_path = os.path.join(MODEL_DIR, "pattern_model.pkl")
+        
+    def build_model(self):
+        """Build pattern model for each possible number."""
+        for num in range(1, self.num_range + 1):
+            model = RandomForestRegressor(
+                n_estimators=self.n_estimators,
+                max_depth=8,
+                min_samples_split=4,
+                min_samples_leaf=2,
+                random_state=num  # Different seed for each model
+            )
+            self.models[num] = model
+            
+        return self.models
+    
+    @ErrorHandler.handle_exception(logger, "pattern model training")
+    def train(self, X_train, y_train):
+        """Train pattern model for each number."""
+        if not self.models:
+            raise ValueError("Models not built. Call build_model() first.")
+            
+        # Train a model for each number
+        for num in range(1, self.num_range + 1):
+            # Target: 1 if number appears in draw, 0 otherwise
+            y_num = np.array([1 if num in draw else 0 for draw in y_train])
+            
+            # Train model
+            self.models[num].fit(X_train, y_num)
+            
+            # Store feature importances
+            self.feature_importances[num] = self.models[num].feature_importances_
+            
+        # Save model
+        self.save()
+        
+        return self.models
+        
+    def predict_probabilities(self, X):
+        """Generate probability for each number appearing in the draw."""
+        if not self.models:
+            raise ValueError("Models not trained")
+            
+        # Get probabilities for each number
+        probabilities = np.zeros((len(X), self.num_range))
+        
+        for num, model in self.models.items():
+            # Predict probability of this number appearing
+            prob = model.predict(X)
+            
+            # Store in probability matrix (convert to 0-indexed)
+            probabilities[:, num-1] = prob
+            
+        # Normalize probabilities
+        row_sums = probabilities.sum(axis=1, keepdims=True)
+        if np.any(row_sums == 0):
+            # Handle zero sums by setting equal probabilities
+            zero_rows = (row_sums == 0).flatten()
+            probabilities[zero_rows, :] = 1.0 / self.num_range
+            # Recalculate sums
+            row_sums = probabilities.sum(axis=1, keepdims=True)
+            
+        probabilities = probabilities / row_sums
+        
+        return probabilities
+    
+    def get_top_numbers(self, X, top_n=10):
+        """Get top n most likely numbers for each input."""
+        probabilities = self.predict_probabilities(X)
+        
+        # Get indices of top n numbers
+        top_indices = np.argsort(probabilities, axis=1)[:, -top_n:]
+        
+        # Convert to actual numbers (1-indexed)
+        top_numbers = top_indices + 1
+        
+        return top_numbers, probabilities[np.arange(len(X))[:, np.newaxis], top_indices]
+    
+    def get_pattern_score(self, numbers):
+        """Calculate pattern score based on lottery best practices."""
+        return Utilities.calculate_pattern_score(numbers)
+    
+    def save(self, path=None):
+        """Save models to disk."""
+        if not self.models:
+            raise ValueError("No models to save")
+            
+        save_path = path or self.checkpoint_path
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        data_to_save = {
+            'models': self.models,
+            'feature_importances': self.feature_importances
+        }
+        
+        with open(save_path, 'wb') as f:
+            import pickle
+            pickle.dump(data_to_save, f)
+            
+        logger.info(f"Pattern models saved to {save_path}")
+        
+    def load(self, path=None):
+        """Load models from disk."""
+        load_path = path or self.checkpoint_path
+        
+        if os.path.exists(load_path):
+            try:
+                with open(load_path, 'rb') as f:
+                    import pickle
+                    data = pickle.load(f)
+                    
+                self.models = data['models']
+                self.feature_importances = data['feature_importances']
+                
+                logger.info(f"Pattern models loaded from {load_path}")
+                return True
+            except Exception as e:
+                logger.error(f"Error loading pattern models: {e}")
+                return False
+        else:
+            logger.warning(f"No saved models found at {load_path}")
+            return False
+
+class BonusNumberModel:
+    """Specialized model for bonus numbers."""
+    
+    def __init__(self, n_estimators=100, learning_rate=0.05, max_depth=4, num_range=BONUS_NUM_MAX):
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.max_depth = max_depth
+        self.num_range = num_range
+        self.position_models = []  # One model per position
+        self.number_models = {}  # One model per possible number
+        self.checkpoint_path = os.path.join(MODEL_DIR, "bonus_model.pkl")
+        
+    def build_model(self, n_positions=BONUS_NUM_COUNT):
+        """Build position-based and number-based models."""
+        # Position models - predict number at each position
+        for pos in range(n_positions):
+            model = GradientBoostingRegressor(
+                n_estimators=self.n_estimators,
+                learning_rate=self.learning_rate,
+                max_depth=self.max_depth,
+                random_state=RANDOM_SEED + pos
+            )
+            self.position_models.append(model)
+            
+        # Number models - predict probability of each number
+        for num in range(1, self.num_range + 1):
+            model = RandomForestRegressor(
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                random_state=100 + num
+            )
+            self.number_models[num] = model
+            
+        return self.position_models, self.number_models
+    
+    @ErrorHandler.handle_exception(logger, "bonus model training")
+    def train(self, X_train, y_train_raw):
+        """Train both position and number models."""
+        if not self.position_models or not self.number_models:
+            raise ValueError("Models not built. Call build_model() first.")
+            
+        # Extract bonus numbers from raw targets
+        bonus_numbers = []
+        for draw_nums in y_train_raw:
+            # Extract just the bonus numbers
+            bonus_nums = draw_nums[-BONUS_NUM_COUNT:] if len(draw_nums) > MAIN_NUM_COUNT else draw_nums[:BONUS_NUM_COUNT]
+            bonus_numbers.append(bonus_nums)
+            
+        # Train position models
+        for pos in range(len(self.position_models)):
+            # Extract target for this position
+            y_pos = np.array([draw[pos] for draw in bonus_numbers if len(draw) > pos])
+            
+            # Train model
+            self.position_models[pos].fit(X_train, y_pos)
+            
+        # Train number models
+        for num in range(1, self.num_range + 1):
+            # Target: 1 if number appears in bonus numbers, 0 otherwise
+            y_num = np.array([1 if num in draw else 0 for draw in bonus_numbers])
+            
+            # Train model
+            self.number_models[num].fit(X_train, y_num)
+            
+        # Save the trained model
+        self.save()
+        
+        return self.position_models, self.number_models
+    
+    def predict_probabilities(self, X):
+        """Generate probability distribution for bonus numbers."""
+        if not self.position_models or not self.number_models:
+            raise ValueError("Models not trained")
+            
+        # Get position-based probabilities
+        position_probs = np.zeros((len(X), self.num_range))
+        
+        for pos, model in enumerate(self.position_models):
+            # Predict position value
+            pred_val = model.predict(X)
+            
+            # Convert to probability distribution
+            for i, val in enumerate(pred_val):
+                # Round to nearest integer
+                center = int(round(val)) - 1  # Convert to 0-indexed
+                
+                # Ensure center is within valid range
+                center = max(0, min(center, self.num_range - 1))
+                
+                # Create Gaussian distribution around predicted value
+                for j in range(self.num_range):
+                    dist = min(abs(j - center), self.num_range - abs(j - center))
+                    position_probs[i, j] += np.exp(-0.5 * (dist/2.0)**2)
+                    
+        # Normalize position probabilities
+        row_sums = position_probs.sum(axis=1, keepdims=True)
+        position_probs = position_probs / row_sums
+        
+        # Get number-based probabilities
+        number_probs = np.zeros((len(X), self.num_range))
+        
+        for num, model in self.number_models.items():
+            # Predict probability of this number appearing
+            prob = model.predict(X)
+            
+            # Store in probability matrix (convert to 0-indexed)
+            number_probs[:, num-1] = prob
+            
+        # Normalize number probabilities
+        row_sums = number_probs.sum(axis=1, keepdims=True)
+        number_probs = number_probs / row_sums
+        
+        # Combine both probability types with ensemble weighting
+        combined_probs = 0.4 * position_probs + 0.6 * number_probs
+        
+        # Final normalization
+        row_sums = combined_probs.sum(axis=1, keepdims=True)
+        combined_probs = combined_probs / row_sums
+        
+        return combined_probs
+    
+    def predict(self, X, n_positions=BONUS_NUM_COUNT):
+        """Generate concrete bonus number predictions."""
+        probabilities = self.predict_probabilities(X)
+        
+        predictions = []
+        for i in range(len(X)):
+            # Sample n_positions without replacement
+            selected_indices = []
+            remaining_probs = probabilities[i].copy()
+            
+            for _ in range(n_positions):
+                # Normalize remaining probabilities
+                if np.sum(remaining_probs) > 0:
+                    remaining_probs = remaining_probs / np.sum(remaining_probs)
+                    
+                # Sample one number
+                selected_idx = np.random.choice(self.num_range, p=remaining_probs)
+                selected_indices.append(selected_idx)
+                
+                # Set probability to zero to avoid resampling
+                remaining_probs[selected_idx] = 0
+            
+            # Convert to actual numbers (1-indexed)
+            selected_numbers = [idx + 1 for idx in selected_indices]
+            predictions.append(sorted(selected_numbers))
+            
         return predictions
     
+    def save(self, path=None):
+        """Save models to disk."""
+        if not self.position_models or not self.number_models:
+            raise ValueError("No models to save")
+            
+        save_path = path or self.checkpoint_path
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        data_to_save = {
+            'position_models': self.position_models,
+            'number_models': self.number_models
+        }
+        
+        with open(save_path, 'wb') as f:
+            import pickle
+            pickle.dump(data_to_save, f)
+            
+        logger.info(f"Bonus number models saved to {save_path}")
+        
+    def load(self, path=None):
+        """Load models from disk."""
+        load_path = path or self.checkpoint_path
+        
+        if os.path.exists(load_path):
+            try:
+                with open(load_path, 'rb') as f:
+                    import pickle
+                    data = pickle.load(f)
+                    
+                self.position_models = data['position_models']
+                self.number_models = data['number_models']
+                
+                logger.info(f"Bonus number models loaded from {load_path}")
+                return True
+            except Exception as e:
+                logger.error(f"Error loading bonus models: {e}")
+                return False
+        else:
+            logger.warning(f"No saved models found at {load_path}")
+            return False
+
 #######################
-# ENSEMBLE PREDICTOR
+# ENSEMBLE MODEL
 #######################
 
-class EnsemblePredictor:
-    """Enhanced ensemble predictor that combines multiple diverse models for better predictions."""
+class EnsembleCalibrator:
+    """Probability calibration for ensemble predictions."""
     
-    def __init__(self, file_path, num_models=5, params=None):
-        """Initialize the ensemble predictor."""
+    def __init__(self, temperature_range=(0.5, 1.5), calibration_factor=0.85):
+        self.temperature_range = temperature_range
+        self.calibration_factor = calibration_factor
+        self.temperature_history = []
+        
+    def calibrate_ensemble(self, model_probs, confidence=None, iteration=0, diversity_factor=0.8):
+        """Calibrate and combine probabilities from different models.
+        
+        Args:
+            model_probs: Dictionary of model probabilities {'model': probabilities}
+            confidence: Optional confidence score to adjust calibration
+            iteration: Current prediction iteration (for diversity)
+            diversity_factor: How much to penalize previously selected numbers
+        """
+        # Calculate dynamic temperature based on confidence and iteration
+        base_temp = self.temperature_range[0] + 0.2 * iteration  # Increase temperature for later iterations
+        
+        if confidence is not None:
+            # Higher confidence -> lower temperature (more deterministic)
+            temp_adjustment = (1.0 - confidence) * (self.temperature_range[1] - self.temperature_range[0])
+            temperature = base_temp + temp_adjustment
+        else:
+            temperature = base_temp
+            
+        # Record temperature for analysis
+        self.temperature_history.append(temperature)
+        
+        # Apply temperature scaling to each model's probabilities
+        scaled_probs = {}
+        for model_name, probs in model_probs.items():
+            # Different models get slightly different temperatures
+            if model_name == 'transformer':
+                # Transformer model gets slightly lower temperature
+                model_temp = temperature * 0.9
+            elif model_name == 'pattern':
+                # Pattern model gets slightly higher temperature
+                model_temp = temperature * 1.1
+            else:
+                model_temp = temperature
+            
+            # Ensure probs is properly shaped before scaling
+            # If probs is a list of arrays, use the first array
+            if isinstance(probs, list) and len(probs) > 0 and isinstance(probs[0], np.ndarray):
+                probs_array = probs[0]
+            else:
+                probs_array = probs
+                
+            # Apply temperature scaling
+            scaled_probs[model_name] = self._apply_temperature(probs_array, model_temp)
+        
+        # Combine using learned weights that evolve with iterations
+        # First draw - trust transformer model more
+        if iteration == 0:
+            weights = {
+                'transformer': 0.4,
+                'frequency': 0.35,
+                'pattern': 0.25
+            }
+        # Middle draws - balanced weights
+        elif iteration < 3:
+            weights = {
+                'transformer': 0.35,
+                'frequency': 0.35,
+                'pattern': 0.3
+            }
+        # Later draws - trust pattern model more for diversity
+        else:
+            weights = {
+                'transformer': 0.25,
+                'frequency': 0.35,
+                'pattern': 0.4
+            }
+        
+        # Combine probabilities with weights
+        # Get a sample shape from one of the probability arrays
+        sample_probs = next(iter(scaled_probs.values()))
+        ensemble_probs = np.zeros_like(sample_probs)
+        
+        for model_name, probs in scaled_probs.items():
+            if model_name in weights:
+                # Ensure shapes match
+                if probs.shape == ensemble_probs.shape:
+                    ensemble_probs += probs * weights[model_name]
+                else:
+                    # Handle shape mismatch (might need reshaping)
+                    try:
+                        # Try basic reshaping if dimensions are compatible
+                        reshaped_probs = np.reshape(probs, ensemble_probs.shape)
+                        ensemble_probs += reshaped_probs * weights[model_name]
+                    except:
+                        # Log the issue and skip this model's contribution
+                        print(f"Shape mismatch in {model_name} model: {probs.shape} vs {ensemble_probs.shape}")
+        
+        # Normalize
+        row_sums = ensemble_probs.sum(axis=1, keepdims=True)
+        if np.any(row_sums == 0):
+            # Handle zero sums
+            zero_rows = (row_sums == 0).flatten()
+            ensemble_probs[zero_rows, :] = 1.0 / ensemble_probs.shape[1]
+            row_sums = ensemble_probs.sum(axis=1, keepdims=True)
+            
+        ensemble_probs = ensemble_probs / row_sums
+            
+        return ensemble_probs
+    
+    def _apply_temperature(self, probabilities, temperature):
+        """Apply temperature scaling to probabilities."""
+        # Avoid division by zero or other numerical issues
+        epsilon = 1e-10
+        
+        # Ensure probabilities is a numpy array
+        if not isinstance(probabilities, np.ndarray):
+            try:
+                probabilities = np.array(probabilities)
+            except:
+                # If conversion fails, try to get the first element if it's a sequence
+                if hasattr(probabilities, '__len__') and len(probabilities) > 0:
+                    probabilities = np.array(probabilities[0])
+                else:
+                    # Last resort
+                    return probabilities
+        
+        # Ensure we have at least 2D array [batch, probabilities]
+        if len(probabilities.shape) == 1:
+            probabilities = probabilities.reshape(1, -1)
+        
+        valid_probs = np.clip(probabilities, epsilon, 1.0 - epsilon)
+        
+        # Apply temperature scaling
+        scaled_probs = np.power(valid_probs, 1/max(0.1, temperature))
+        
+        # Renormalize
+        row_sums = scaled_probs.sum(axis=1, keepdims=True)
+        # Avoid division by zero
+        row_sums = np.maximum(row_sums, epsilon)
+        scaled_probs = scaled_probs / row_sums
+        
+        return scaled_probs
+    
+    def adjust_for_diversity(self, probabilities, used_numbers, diversity_factor=0.8):
+        """Adjust probabilities to encourage diversity in selections."""
+        if not used_numbers:
+            return probabilities
+            
+        # Ensure probabilities is a numpy array and properly shaped
+        if not isinstance(probabilities, np.ndarray):
+            try:
+                probabilities = np.array(probabilities)
+            except:
+                # If conversion fails, try to get the first element if it's a sequence
+                if hasattr(probabilities, '__len__') and len(probabilities) > 0:
+                    probabilities = np.array(probabilities[0])
+                else:
+                    # Last resort: return original
+                    return probabilities
+        
+        # Ensure we have at least 2D array [batch, probabilities]
+        if len(probabilities.shape) == 1:
+            probabilities = probabilities.reshape(1, -1)
+        
+        adjusted_probs = probabilities.copy()
+        
+        # Reduce probabilities for already used numbers
+        for num in used_numbers:
+            if 1 <= num <= adjusted_probs.shape[1]:
+                adjusted_probs[:, num-1] *= diversity_factor
+        
+        # Renormalize
+        row_sums = adjusted_probs.sum(axis=1, keepdims=True)
+        # Avoid division by zero
+        epsilon = 1e-10
+        row_sums = np.maximum(row_sums, epsilon)
+        adjusted_probs = adjusted_probs / row_sums
+        
+        return adjusted_probs
+    
+    def calculate_calibrated_confidence(self, probabilities, selected_indices, pattern_score):
+        """Calculate calibrated confidence score based on probabilities and pattern."""
+        # Ensure probabilities is properly shaped
+        if not isinstance(probabilities, np.ndarray):
+            try:
+                probabilities = np.array(probabilities)
+            except:
+                # If conversion fails, try to get the first element if it's a sequence
+                if hasattr(probabilities, '__len__') and len(probabilities) > 0:
+                    probabilities = np.array(probabilities[0])
+                else:
+                    # Last resort: use a default confidence value
+                    return 0.5
+        
+        # Ensure we have at least 2D array [batch, probabilities]
+        if len(probabilities.shape) == 1:
+            probabilities = probabilities.reshape(1, -1)
+        
+        # Extract probabilities of selected numbers
+        selected_probs = []
+        for idx in selected_indices:
+            if 0 <= idx < probabilities.shape[1]:  # Ensure index is valid
+                # Get the probability for this index (first batch)
+                prob = probabilities[0, idx]
+                if hasattr(prob, '__len__'):  # If it's a sequence, take first element
+                    prob = prob[0] if len(prob) > 0 else 0.0
+                selected_probs.append(float(prob))
+        
+        # Calculate mean probability
+        mean_prob = np.mean(selected_probs) if selected_probs else 0.0
+        
+        # Scale mean probability to favor values over random chance
+        # For 5/50 numbers, random chance is 0.1, so scale to stretch the range
+        prob_factor = (mean_prob - 0.1) / 0.9 if mean_prob > 0.1 else 0.0
+        scaled_prob = 0.5 + 0.5 * prob_factor  # Scale to 0.5-1.0 range for probs above random
+        
+        # Combine with pattern score using calibration factor
+        combined_score = self.calibration_factor * scaled_prob + (1 - self.calibration_factor) * pattern_score
+        
+        # Apply final sigmoid calibration for better scaling
+        confidence = 1.0 / (1.0 + np.exp(-5.0 * (combined_score - 0.5)))
+        
+        return min(0.99, confidence)  # Cap at 0.99 for realism
+
+#######################
+# HYBRID SYSTEM
+#######################
+
+class HybridNeuralSystem:
+    """Unified hybrid lottery prediction system combining multiple models."""
+    
+    def __init__(self, file_path=None, data=None, params=None):
+        """Initialize the hybrid lottery prediction system."""
         self.file_path = file_path
-        self.num_models = num_models
+        self.raw_data = data
         self.params = params if params is not None else Utilities.get_default_params()
-        self.base_predictors = []
-        self.processor = LotteryDataProcessor(file_path)
-        self.data_dict = None
-        self.model_architectures = ['transformer', 'lstm', 'rnn']  # Multiple architecture types
         
-    @ErrorHandler.handle_exception(logger, "ensemble training")
-    def train(self):
-        """Train multiple diverse base models with different architectures."""
-        logger.info(f"Training {self.num_models} diverse base models for ensemble")
+        # Create distribution strategy
+        self.distribution_strategy = create_distribution_strategy()
         
-        # First, train a main predictor to use its data
-        main_predictor = LotteryPredictionSystem(self.file_path, self.params)
-        self.data_dict = main_predictor.prepare_data()
+        # Initialize processor
+        self.processor = LotteryDataProcessor(file_path, data)
+        self.processor.set_sequence_length(self.params.get('sequence_length', DEFAULT_SEQUENCE_LENGTH))
         
-        # Train the main predictor
-        main_predictor.train_model()
-        self.base_predictors.append(main_predictor)
+        # Initialize models
+        self.transformer_model = None
+        self.frequency_model = None
+        self.pattern_model = None
+        self.bonus_model = None
         
-        # Train additional diverse models - only if more than one requested
-        if self.num_models > 1:
-            # Create and initialize shared data structures to avoid redundant processing
-            input_dim = self.data_dict["X"].shape[1]
-            n_samples = len(self.data_dict["X"])
+        # Data attributes
+        self.features = None
+        self.features_scaled = None
+        self.main_sequences = None
+        self.bonus_sequences = None
+        self.y_main = None
+        self.y_bonus = None
+        self.y_main_raw = None
+        self.y_bonus_raw = None
+    
+        # Calibrator for ensemble predictions
+        self.calibrator = EnsembleCalibrator()
+
+    def backtest(self, num_past_draws=20):
+        """Backtest predictions against historical draws.
+        
+        Args:
+            num_past_draws: Number of past draws to use for backtesting
             
-            # Use different architectures for diversity
-            for i in range(1, self.num_models):
-                try:
-                    logger.info(f"Training base model {i+1}/{self.num_models}")
-                    
-                    # Create diverse parameters with different architectures
-                    model_params = self._create_diverse_params(
-                        self.params, 
-                        i, 
-                        architecture=self.model_architectures[i % len(self.model_architectures)]
-                    )
-                    
-                    # Create a new prediction system, reusing the data from the main predictor
-                    predictor = LotteryPredictionSystem(self.file_path, model_params)
-                    
-                    # Share data to avoid reprocessing
-                    predictor.data_prepared = True
-                    predictor.X_scaled = main_predictor.X_scaled
-                    predictor.main_sequences = main_predictor.main_sequences
-                    predictor.bonus_sequences = main_predictor.bonus_sequences
-                    predictor.processor = main_predictor.processor  # Share the processor to avoid duplicate data loading
-                    
-                    # Create the model with the diversity parameters
-                    predictor.model = LotteryModel(model_params)
-                    predictor.sequence_length = model_params.get('sequence_length', DEFAULT_SEQUENCE_LENGTH)
-                    predictor.model.build_models(input_dim, predictor.sequence_length)
-                    
-                    # Set different random seed for each model
-                    seed = i * 100 + RANDOM_SEED
-                    set_seeds(seed)
-                    
-                    # Different sampling strategies for diversity
-                    if i % 3 == 0:
-                        # Standard training
-                        bootstrap_indices = np.arange(n_samples)
-                    elif i % 3 == 1:
-                        # Bootstrap sampling - sampling with replacement
-                        bootstrap_indices = np.random.choice(n_samples, n_samples, replace=True)
-                    else:
-                        # Bagging with reduced dataset - sampling subset without replacement
-                        subset_size = int(n_samples * 0.8)  # Use 80% of data
-                        bootstrap_indices = np.random.choice(n_samples, subset_size, replace=False)
-                    
-                    X_bootstrap = self.data_dict["X"][bootstrap_indices]
-                    main_seq_bootstrap = self.data_dict["main_sequences"][bootstrap_indices]
-                    bonus_seq_bootstrap = self.data_dict["bonus_sequences"][bootstrap_indices]
-                    y_main_bootstrap = self.data_dict["y_main"][bootstrap_indices]
-                    y_bonus_bootstrap = self.data_dict["y_bonus"][bootstrap_indices]
-                    
-                    # Train with different epochs to introduce diversity
-                    # Create a unique validation split for each model
-                    val_split = 0.1 + (i % 5) * 0.02  # Varies from 0.1 to 0.18
-                    
-                    # Adjust epochs based on model index
-                    epochs_factor = 0.7 + (i % 3) * 0.15  # Varies from 0.7 to 1.0
-                    adjusted_epochs = int(50 * epochs_factor)  # Base of 50 epochs
-                    
-                    predictor.model.train_models(
-                        X_train=X_bootstrap,
-                        main_seq_train=main_seq_bootstrap,
-                        bonus_seq_train=bonus_seq_bootstrap,
-                        y_main_train=y_main_bootstrap,
-                        y_bonus_train=y_bonus_bootstrap,
-                        validation_split=val_split,
-                        epochs=adjusted_epochs
-                    )
-                    
-                    # Add to ensemble
-                    self.base_predictors.append(predictor)
-                    
-                    # Clean memory less frequently for efficiency
-                    if i % 2 == 0:
-                        Utilities.clean_memory()
-                    
-                except Exception as e:
-                    logger.error(f"Error training model {i+1}: {e}")
-                    # Continue with other models even if one fails
-                    continue
+        Returns:
+            Dictionary with backtesting metrics
+        """
+        logger.info(f"Running backtesting against {num_past_draws} historical draws")
         
-        # Reset random seeds for consistency
-        set_seeds()
+        # Ensure data is loaded
+        if self.processor.data is None:
+            self.prepare_data()
+            
+        # Get historical draws
+        if self.processor.data is None or len(self.processor.data) < num_past_draws:
+            logger.error(f"Not enough historical data for backtesting (need at least {num_past_draws} draws)")
+            return {
+                'success': False,
+                'error': 'Insufficient historical data'
+            }
+            
+        # Get the latest draws for testing
+        test_draws = self.processor.data.tail(num_past_draws).copy()
         
-        logger.info(f"Ensemble training complete with {len(self.base_predictors)} models")
+        # Remove test draws from training data
+        train_data = self.processor.data.iloc[:-num_past_draws].copy()
+        
+        # Create a new processor with just the training data
+        train_processor = LotteryDataProcessor(data=train_data)
+        
+        # Create a temporary system with only training data
+        temp_system = HybridNeuralSystem(data=train_data, params=self.params)
+        temp_system.processor = train_processor
+        
+        # Prepare data, build and train models
+        logger.info("Preparing data for backtesting...")
+        temp_system.prepare_data()
+        
+        logger.info("Building models for backtesting...")
+        temp_system.build_models()
+        
+        logger.info("Training models for backtesting...")
+        temp_system.train_models()
+        
+        # Generate predictions for comparison with actual draws
+        backtest_results = []
+        total_score = 0.0
+        
+        logger.info("Generating backtesting predictions...")
+        
+        for idx, (_, row) in enumerate(test_draws.iterrows()):
+            # Generate a prediction that would have been made before this draw
+            prediction = temp_system.predict(num_draws=1)[0]
+            
+            # Format actual draw
+            actual_draw = {
+                "main_numbers": row["main_numbers"],
+                "main_number_positions": {num: i for i, num in enumerate(row["main_numbers"])},
+                "bonus_numbers": row["bonus_numbers"]
+            }
+            
+            # Calculate match score
+            match_score = Utilities.calculate_partial_match_score(prediction, actual_draw)
+            total_score += match_score
+            
+            # Store detailed results
+            backtest_results.append({
+                "draw_index": idx + 1,
+                "draw_date": row["date"].strftime("%Y-%m-%d") if hasattr(row["date"], "strftime") else str(row["date"]),
+                "predicted_main": prediction["main_numbers"],
+                "actual_main": row["main_numbers"],
+                "predicted_bonus": prediction["bonus_numbers"],
+                "actual_bonus": row["bonus_numbers"],
+                "match_score": match_score,
+                "confidence": prediction["confidence"]["overall"]
+            })
+            
+            logger.info(f"Backtest draw {idx+1}: Match Score = {match_score:.4f}")
+        
+        # Calculate overall metrics
+        avg_match_score = total_score / len(backtest_results) if backtest_results else 0.0
+        
+        # Count different match levels
+        match_counts = {
+            '0': 0, '1': 0, '2': 0, '3': 0, '4': 0, '5': 0,  # main numbers
+            '0+0': 0, '0+1': 0, '0+2': 0,  # 0 main + bonus
+            '1+0': 0, '1+1': 0, '1+2': 0,  # 1 main + bonus
+            '2+0': 0, '2+1': 0, '2+2': 0,  # 2 main + bonus
+            '3+0': 0, '3+1': 0, '3+2': 0,  # 3 main + bonus
+            '4+0': 0, '4+1': 0, '4+2': 0,  # 4 main + bonus
+            '5+0': 0, '5+1': 0, '5+2': 0   # 5 main + bonus
+        }
+        
+        # Count matches by category
+        for result in backtest_results:
+            main_matches = len(set(result["predicted_main"]).intersection(set(result["actual_main"])))
+            bonus_matches = len(set(result["predicted_bonus"]).intersection(set(result["actual_bonus"])))
+            
+            # Update main count
+            if str(main_matches) in match_counts:
+                match_counts[str(main_matches)] += 1
+                
+            # Update combined count
+            combined_key = f"{main_matches}+{bonus_matches}"
+            if combined_key in match_counts:
+                match_counts[combined_key] += 1
+        
+        # Calculate expected prize winnings based on match categories
+        # This is a very simplified model and actual prizes vary significantly
+        prize_expectations = {
+            '2+0': 0.0,      # No prize typically
+            '2+1': 4.30,     # Estimated average prize
+            '2+2': 7.50,
+            '3+0': 6.00,
+            '3+1': 10.70,
+            '3+2': 43.30,
+            '4+0': 25.60,
+            '4+1': 123.00,
+            '4+2': 844.70,
+            '5+0': 33466.40,
+            '5+1': 256213.60,
+            '5+2': 17000000.00  # Jackpot - very rough estimate
+        }
+        
+        # Calculate expected return
+        expected_return = 0.0
+        for category, count in match_counts.items():
+            if category in prize_expectations:
+                expected_return += count * prize_expectations[category]
+        
+        # Assuming each prediction costs 2.50 EUR
+        prediction_cost = len(backtest_results) * 2.50
+        net_return = expected_return - prediction_cost
+        roi = (net_return / prediction_cost) if prediction_cost > 0 else 0.0
+        
+        logger.info(f"Backtesting complete: Avg Match Score = {avg_match_score:.4f}")
+        logger.info(f"Expected Return: €{expected_return:.2f}, ROI: {roi*100:.2f}%")
+        
+        return {
+            'success': True,
+            'avg_match_score': avg_match_score,
+            'detailed_results': backtest_results,
+            'match_counts': match_counts,
+            'expected_return': expected_return,
+            'cost': prediction_cost,
+            'net_return': net_return,
+            'roi': roi
+        }
+        
+    @ErrorHandler.handle_exception(logger, "data preparation")
+    def prepare_data(self, force_reprocess=False):
+        """Prepare data for model training and prediction."""
+        logger.info("Preparing data for model training")
+        
+        # Load and process data
+        df = self.processor.parse_file()
+        if df.empty:
+            raise ValueError("Failed to load lottery data")
+                
+        # Create expanded data
+        expanded_df = self.processor.expand_numbers()
+        
+        # Generate features
+        self.features = self.processor.create_features()
+        
+        # Create sequences
+        self.main_sequences, self.bonus_sequences, self.y_main, self.y_bonus = self.processor.create_sequences()
+        
+        # Get actual number of samples in sequence data
+        if self.main_sequences is not None:
+            seq_length = self.processor.sequence_length
+            num_seq_samples = self.main_sequences.shape[0]
+            
+            # Important: Trim features to exactly match sequence data
+            # The sequences start from seq_length onwards, so features should too
+            feature_start_idx = seq_length
+            feature_end_idx = feature_start_idx + num_seq_samples
+            logger.info(f"Adjusting features from index {feature_start_idx} to {feature_end_idx} "
+                      f"to match sequence data with {num_seq_samples} samples")
+            
+            if isinstance(self.features, pd.DataFrame) and feature_end_idx <= len(self.features):
+                self.features = self.features.iloc[feature_start_idx:feature_end_idx].reset_index(drop=True)
+            else:
+                logger.warning(f"Could not properly subset features. Features shape: {self.features.shape}, "
+                            f"Desired range: {feature_start_idx}:{feature_end_idx}")
+            
+            # Create raw targets for models that need them
+            self.y_main_raw = expanded_df.iloc[seq_length:seq_length+num_seq_samples]['main_numbers'].values
+            self.y_bonus_raw = expanded_df.iloc[seq_length:seq_length+num_seq_samples]['bonus_numbers'].values
+            
+            # Scale features
+            scaler = StandardScaler()
+            self.features_scaled = scaler.fit_transform(self.features.select_dtypes(include=[np.number]))
+            
+            # Convert back to DataFrame for easier access
+            self.features_scaled = pd.DataFrame(
+                self.features_scaled,
+                columns=self.features.select_dtypes(include=[np.number]).columns,
+                index=self.features.index
+            )
+            
+            # Double check dimensions
+            logger.info(f"Final data dimensions:")
+            logger.info(f"  Features: {self.features_scaled.shape}")
+            logger.info(f"  Main sequences: {self.main_sequences.shape}")
+            logger.info(f"  Y main: {self.y_main.shape}")
+            logger.info(f"  Y main raw: {len(self.y_main_raw)}")
+            
+            if self.features_scaled.shape[0] != self.main_sequences.shape[0]:
+                logger.warning("Data dimension mismatch after preparation! This may cause training errors.")
+                
+            logger.info(f"Data preparation complete: {len(self.features_scaled)} samples")
+        else:
+            # Handle case where sequence data could not be created
+            logger.warning("Sequence data not available. Some models may not function correctly.")
+            
+            # Scale features anyway
+            scaler = StandardScaler()
+            self.features_scaled = scaler.fit_transform(self.features.select_dtypes(include=[np.number]))
+            
+            # Set raw targets to None
+            self.y_main_raw = None
+            self.y_bonus_raw = None
+            
+            logger.info(f"Data preparation complete: {len(self.features_scaled)} samples (no sequences)")
+        
+        return {
+            "features": self.features,
+            "features_scaled": self.features_scaled,
+            "main_sequences": self.main_sequences,
+            "bonus_sequences": self.bonus_sequences,
+            "y_main": self.y_main,
+            "y_bonus": self.y_bonus,
+            "y_main_raw": self.y_main_raw,
+            "y_bonus_raw": self.y_bonus_raw,
+            "data": self.processor.data
+        }
+    
+    @ErrorHandler.handle_exception(logger, "model building")
+    def build_models(self):
+        """Build all prediction models."""
+        logger.info("Building prediction models")
+        
+        # Ensure data is prepared
+        if self.features_scaled is None:
+            self.prepare_data()
+        
+        # Make sure we have sequence data
+        if self.main_sequences is None:
+            raise ValueError("No sequence data available. Cannot build models.")
+        
+        # Build transformer model
+        if self.params.get('use_transformer_model', True):
+            logger.info("Building transformer model")
+            # Get the actual sequence dimensions from the data
+            actual_seq_length = self.main_sequences.shape[1]
+            actual_seq_dim = self.main_sequences.shape[2]
+            
+            # Update the sequence_length in params to match the actual data
+            self.params['sequence_length'] = actual_seq_length
+            
+            # Build sequence model with correct dimensions and distribution strategy
+            input_shape = (self.features_scaled.shape[1], actual_seq_dim)
+            self.transformer_model = TransformerModel(
+                input_shape=input_shape,
+                output_dim=MAIN_NUM_MAX,
+                params=self.params,
+                distribution_strategy=self.distribution_strategy
+            )
+            self.transformer_model.build_model()
+        
+        # Build frequency model
+        if self.params.get('use_frequency_model', True):
+            logger.info("Building frequency model")
+            self.frequency_model = FrequencyModel(
+                n_estimators=200,
+                learning_rate=0.05,
+                max_depth=5
+            )
+            # Try to load existing model first if available
+            if hasattr(self, 'load_existing') and self.load_existing:
+                if not self.frequency_model.load():
+                    logger.info("Could not load frequency model, building new one")
+                    self.frequency_model.build_model(n_positions=MAIN_NUM_COUNT)
+            else:
+                self.frequency_model.build_model(n_positions=MAIN_NUM_COUNT)
+        
+        # Build pattern model
+        if self.params.get('use_pattern_model', True):
+            logger.info("Building pattern model")
+            self.pattern_model = PatternModel(
+                n_estimators=150,
+                num_range=MAIN_NUM_MAX
+            )
+            # Try to load existing model first if available
+            if hasattr(self, 'load_existing') and self.load_existing:
+                if not self.pattern_model.load():
+                    logger.info("Could not load pattern model, building new one")
+                    self.pattern_model.build_model()
+            else:
+                self.pattern_model.build_model()
+        
+        # Build bonus model
+        logger.info("Building bonus model")
+        self.bonus_model = BonusNumberModel(
+            n_estimators=100,
+            learning_rate=0.05,
+            max_depth=4,
+            num_range=BONUS_NUM_MAX
+        )
+        # Try to load existing model first if available
+        if hasattr(self, 'load_existing') and self.load_existing:
+            if not self.bonus_model.load():
+                logger.info("Could not load bonus model, building new one")
+                self.bonus_model.build_model(n_positions=BONUS_NUM_COUNT)
+        else:
+            self.bonus_model.build_model(n_positions=BONUS_NUM_COUNT)
+        
+        logger.info("All models built successfully")
+        
+        return {
+            'transformer_model': self.transformer_model,
+            'frequency_model': self.frequency_model,
+            'pattern_model': self.pattern_model,
+            'bonus_model': self.bonus_model
+        }
+    
+    @ErrorHandler.handle_exception(logger, "model training")
+    def train_models(self, validation_split=0.2):
+        """Train all prediction models with improved error handling."""
+        logger.info("Training prediction models")
+        
+        # Ensure models are built
+        if self.transformer_model is None:
+            self.build_models()
+        
+        # Ensure data is prepared
+        if self.features_scaled is None:
+            self.prepare_data()
+        
+        # Prepare arrays
+        X_features = self.features_scaled.values
+        
+        # Train models with individual try-except blocks for each
+        transformer_model_trained = False
+        
+        # Try to train transformer model, but don't fail the whole process if it fails
+        if self.params.get('use_transformer_model', True) and self.transformer_model is not None:
+            try:
+                logger.info("Training transformer model")
+                self.transformer_model.train(
+                    X_train=(X_features, self.main_sequences),
+                    y_train=self.y_main,
+                    validation_split=validation_split
+                )
+                transformer_model_trained = True
+                logger.info("Transformer model training completed successfully")
+            except Exception as e:
+                logger.error(f"Error training transformer model: {e}")
+                logger.error(traceback.format_exc())
+                logger.warning("Will continue with other models")
+        
+        # Clean memory
+        Utilities.clean_memory()
+        
+        # Train frequency model
+        if self.params.get('use_frequency_model', True) and self.frequency_model is not None:
+            try:
+                logger.info("Training frequency model")
+                self.frequency_model.train(
+                    X_train=X_features,
+                    y_train_raw=self.y_main_raw
+                )
+                logger.info("Frequency model training completed successfully")
+            except Exception as e:
+                logger.error(f"Error training frequency model: {e}")
+                logger.error(traceback.format_exc())
+        
+        # Clean memory
+        Utilities.clean_memory()
+        
+        # Train pattern model
+        if self.params.get('use_pattern_model', True) and self.pattern_model is not None:
+            try:
+                logger.info("Training pattern model")
+                self.pattern_model.train(
+                    X_train=X_features,
+                    y_train=self.y_main_raw
+                )
+                logger.info("Pattern model training completed successfully")
+            except Exception as e:
+                logger.error(f"Error training pattern model: {e}")
+                logger.error(traceback.format_exc())
+        
+        # Clean memory
+        Utilities.clean_memory()
+        
+        # Train bonus model
+        try:
+            logger.info("Training bonus model")
+            self.bonus_model.train(
+                X_train=X_features,
+                y_train_raw=self.y_main_raw  # Use main numbers as context
+            )
+            logger.info("Bonus model training completed successfully")
+        except Exception as e:
+            logger.error(f"Error training bonus model: {e}")
+            logger.error(traceback.format_exc())
+        
+        # Clean memory
         Utilities.clean_memory(force=True)
-        return self.base_predictors
+        
+        return True
     
-    def _create_diverse_params(self, base_params, model_index, architecture='transformer'):
-        """Create diverse parameters for ensemble models with architecture variations."""
-        diverse_params = base_params.copy()
-        
-        # Set model architecture type
-        diverse_params['model_type'] = architecture
-        
-        # Apply diversity techniques based on architecture
-        if architecture == 'transformer':
-            # Transformer-specific parameters
-            diverse_params['dropout_rate'] = base_params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * (0.8 + 0.5 * random.random())
-            diverse_params['num_heads'] = random.choice([2, 3, 4, 8])
-            diverse_params['ff_dim'] = random.choice([64, 96, 128, 192])
-            diverse_params['num_transformer_blocks'] = random.choice([1, 2, 3])
-            diverse_params['use_residual'] = random.choice([True, False])
-            diverse_params['use_layer_scaling'] = random.choice([True, False])
-            # Fix: Ensure conv_filters is at least 1
-            diverse_params['conv_filters'] = random.choice([16, 24, 32])
-            
-        elif architecture == 'lstm':
-            # LSTM-specific parameters
-            diverse_params['dropout_rate'] = base_params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * (0.9 + 0.3 * random.random())
-            diverse_params['lstm_units'] = random.choice([24, 32, 48, 64])
-            # Fix: Ensure conv_filters is at least 1
-            diverse_params['conv_filters'] = random.choice([16, 24, 32])
-            
-        elif architecture == 'rnn':
-            # RNN-specific parameters
-            diverse_params['dropout_rate'] = base_params.get('dropout_rate', DEFAULT_DROPOUT_RATE) * (0.7 + 0.6 * random.random())
-            diverse_params['embed_dim'] = random.choice([32, 48, 64])
-            # Fix: Ensure conv_filters is at least 1
-            diverse_params['conv_filters'] = random.choice([8, 16, 24])
-            
-        # Common parameter diversity
-        # Learning rate diversity - wider range for exploration
-        diverse_params['learning_rate'] = base_params.get('learning_rate', DEFAULT_LEARNING_RATE) * (0.5 + 1.0 * random.random())
-        
-        # Fix: Use consistent sequence length
-        diverse_params['sequence_length'] = base_params.get('sequence_length', 20)  # Use existing or default to 20
-        
-        # Optimizer diversity
-        diverse_params['optimizer'] = random.choice(['adam', 'rmsprop', 'sgd'])
-        
-        # L2 regularization diversity
-        diverse_params['l2_regularization'] = base_params.get('l2_regularization', 0.0001) * (0.5 + 1.5 * random.random())
-        
-        return diverse_params
-    
-    @ErrorHandler.handle_exception(logger, "ensemble prediction")    
+    @ErrorHandler.handle_exception(logger, "prediction", lambda self, num_draws, **kwargs: self.generate_fallback_predictions(num_draws))
     def predict(self, num_draws=5, temperature=DEFAULT_TEMPERATURE, diversity_sampling=True):
-        """Generate ensemble predictions by combining model outputs with improved weighting."""
-        logger.info(f"Generating {num_draws} ensemble predictions")
+        """Generate predictions using ensemble of models."""
+        logger.info(f"Generating {num_draws} lottery predictions")
         
-        if not self.base_predictors:
-            logger.error("No base predictors. Call train() first.")
-            # Fallback to single predictor
-            predictor = LotteryPredictionSystem(self.file_path, self.params)
-            predictor.train_model()
-            return predictor.predict(num_draws)
+        # Ensure at least one model is trained
+        if (self.transformer_model is None and self.frequency_model is None and 
+            self.pattern_model is None and self.bonus_model is None):
+            raise ValueError("No models are trained. Call train_models() first.")
         
-        # Get the first predictor as reference
-        main_predictor = self.base_predictors[0]
+        # Verify frequency model is properly fitted
+        if self.frequency_model is not None:
+            try:
+                # Check if models are empty or not fitted
+                if not self.frequency_model.models or not hasattr(self.frequency_model.models[0], 'feature_importances_'):
+                    logger.warning("Frequency model not properly trained or loaded. Attempting to train now...")
+                    # Check if we have the data needed to train
+                    if self.features_scaled is not None and self.y_main_raw is not None:
+                        X_features = self.features_scaled.values if hasattr(self.features_scaled, 'values') else self.features_scaled
+                        self.frequency_model.train(X_train=X_features, y_train_raw=self.y_main_raw)
+                        logger.info("Frequency model trained successfully")
+                    else:
+                        logger.error("Cannot train frequency model: training data not available")
+                        logger.info("Disabling frequency model for predictions")
+                        self.frequency_model = None
+            except Exception as e:
+                logger.error(f"Error verifying/training frequency model: {e}")
+                logger.error(traceback.format_exc())
+                logger.info("Disabling frequency model for predictions")
+                self.frequency_model = None
         
-        # Get latest data for prediction
-        latest_features = main_predictor.X_scaled.iloc[-1:].values
+        # Similarly verify pattern model
+        if self.pattern_model is not None:
+            try:
+                # Check if models are empty or not fitted
+                test_model = next(iter(self.pattern_model.models.values())) if self.pattern_model.models else None
+                if not self.pattern_model.models or not hasattr(test_model, 'feature_importances_'):
+                    logger.warning("Pattern model not properly trained or loaded. Attempting to train now...")
+                    # Check if we have the data needed to train
+                    if self.features_scaled is not None and self.y_main_raw is not None:
+                        X_features = self.features_scaled.values if hasattr(self.features_scaled, 'values') else self.features_scaled
+                        self.pattern_model.train(X_train=X_features, y_train=self.y_main_raw)
+                        logger.info("Pattern model trained successfully")
+                    else:
+                        logger.error("Cannot train pattern model: training data not available")
+                        logger.info("Disabling pattern model for predictions")
+                        self.pattern_model = None
+            except Exception as e:
+                logger.error(f"Error verifying/training pattern model: {e}")
+                logger.error(traceback.format_exc())
+                logger.info("Disabling pattern model for predictions")
+                self.pattern_model = None
+        
+        # Get latest data point for prediction
+        latest_features = self.features_scaled.values[-1:] if hasattr(self.features_scaled, 'values') else self.features_scaled[-1:]
+        latest_main_seq = self.main_sequences[-1:] if self.main_sequences is not None else None
+        latest_bonus_seq = self.bonus_sequences[-1:] if self.bonus_sequences is not None else None
+        
+        # Handle case where sequences are None (not enough data)
+        if latest_main_seq is None or latest_bonus_seq is None:
+            logger.warning("Not enough sequence data. Using fallback predictions.")
+            return self.generate_fallback_predictions(num_draws)
         
         # Track used numbers for diversity
         used_main_numbers = set()
@@ -2323,222 +3778,282 @@ class EnsemblePredictor:
         # Generate predictions
         predictions = []
         
-        # Get and store model weights based on validation performance
-        model_weights = self._calculate_model_weights()
+        # Get ensemble weights from parameters
+        ensemble_weights = self.params.get('ensemble_weights', {
+            'transformer': 0.4,
+            'frequency': 0.3,
+            'pattern': 0.3
+        })
+        
+        # Adjust weights based on which models are available
+        if self.transformer_model is None:
+            ensemble_weights['transformer'] = 0
+        if self.frequency_model is None:
+            ensemble_weights['frequency'] = 0
+        if self.pattern_model is None:
+            ensemble_weights['pattern'] = 0
+            
+        # Renormalize weights if needed
+        weight_sum = sum(ensemble_weights.values())
+        if weight_sum > 0:
+            ensemble_weights = {k: v / weight_sum for k, v in ensemble_weights.items()}
         
         for draw_idx in range(num_draws):
-            # Initialize arrays for weighted averaging of probabilities from all models
-            main_probs = [np.zeros((1, MAIN_NUM_MAX)) for _ in range(MAIN_NUM_COUNT)]
-            bonus_probs = [np.zeros((1, BONUS_NUM_MAX)) for _ in range(BONUS_NUM_COUNT)]
-            
-            # Track weights used for normalization
-            total_weight = 0
-            
-            # Get predictions from each model and average them with weights
-            for idx, predictor in enumerate(self.base_predictors):
-                try:
-                    if predictor.model is None:
-                        continue
-                        
-                    # Get appropriate sequence data for this model
-                    # (Models might have different sequence lengths)
-                    pred_seq_length = predictor.sequence_length
+            try:
+                model_probs = {}
+                
+                # Get transformer model predictions
+                if self.transformer_model is not None:
+                    transformer_probs = self.transformer_model.predict((latest_features, latest_main_seq))
+                    model_probs['transformer'] = transformer_probs
+                
+                # Get frequency model predictions
+                if self.frequency_model is not None:
+                    freq_probs = self.frequency_model.predict_probabilities(latest_features)
+                    model_probs['frequency'] = freq_probs.reshape(1, -1)
+                
+                # Get pattern model predictions
+                if self.pattern_model is not None:
+                    pattern_probs = self.pattern_model.predict_probabilities(latest_features)
+                    model_probs['pattern'] = pattern_probs
+                
+                # Calculate overall confidence for temperature adjustment
+                if draw_idx > 0 and predictions:
+                    avg_confidence = np.mean([p["confidence"]["overall"] for p in predictions])
+                else:
+                    avg_confidence = 0.5  # Default for first draw
+                
+                # Apply calibration and ensemble weighting
+                ensemble_probs = self.calibrator.calibrate_ensemble(
+                    model_probs,
+                    confidence=avg_confidence,
+                    iteration=draw_idx,
+                    diversity_factor=DIVERSITY_FACTOR
+                )
+                
+                # Adjust for diversity
+                if draw_idx > 0 and diversity_sampling and used_main_numbers:
+                    ensemble_probs = self.calibrator.adjust_for_diversity(
+                        ensemble_probs,
+                        used_main_numbers,
+                        diversity_factor=DIVERSITY_FACTOR
+                    )
+                
+                # Sample main numbers
+                main_numbers = Utilities.sample_numbers(
+                    probs=[ensemble_probs],
+                    available_nums=range(MAIN_NUM_MIN, MAIN_NUM_MAX+1),
+                    num_to_select=MAIN_NUM_COUNT,
+                    used_nums=used_main_numbers,
+                    diversity_sampling=diversity_sampling,
+                    draw_idx=draw_idx,
+                    temperature=temperature
+                )
+                
+                # Get bonus number predictions
+                bonus_probs = self.bonus_model.predict_probabilities(latest_features)
+                
+                # Adjust for diversity
+                if draw_idx > 0 and diversity_sampling and used_bonus_numbers:
+                    bonus_probs = self.calibrator.adjust_for_diversity(
+                        bonus_probs,
+                        used_bonus_numbers,
+                        diversity_factor=DIVERSITY_FACTOR
+                    )
+                
+                # Sample bonus numbers
+                bonus_numbers = Utilities.sample_numbers(
+                    probs=[bonus_probs],
+                    available_nums=range(BONUS_NUM_MIN, BONUS_NUM_MAX+1),
+                    num_to_select=BONUS_NUM_COUNT,
+                    used_nums=used_bonus_numbers,
+                    diversity_sampling=diversity_sampling,
+                    draw_idx=draw_idx,
+                    temperature=temperature
+                )
+                
+                # Store position information for analysis
+                main_positions = {num: idx for idx, num in enumerate(main_numbers)}
+                
+                # Calculate pattern score
+                pattern_score = Utilities.calculate_pattern_score(main_numbers, bonus_numbers)
+                
+                # Calculate frequency score if historical data is available
+                frequency_score = 0.5  # Default
+                if self.processor.data is not None and not self.processor.data.empty:
+                    frequency_score = Utilities.calculate_frequency_score(
+                        main_numbers, bonus_numbers, self.processor.data
+                    )
+                
+                # Calculate calibrated confidence
+                # Extract indices for selected numbers (0-based)
+                selected_indices = [num - 1 for num in main_numbers]
+                confidence = self.calibrator.calculate_calibrated_confidence(
+                    ensemble_probs,
+                    selected_indices,
+                    pattern_score
+                )
+                
+                # Add prediction
+                predictions.append({
+                    "main_numbers": main_numbers,
+                    "main_number_positions": main_positions,
+                    "bonus_numbers": bonus_numbers,
+                    "confidence": {
+                        "overall": float(confidence),
+                        "main_numbers": float(min(0.95, confidence + 0.05 * (1.0 - pattern_score))),
+                        "bonus_numbers": float(min(0.90, 0.75 * confidence)),
+                        "pattern_score": float(pattern_score),
+                        "frequency_score": float(frequency_score)
+                    },
+                    "method": "hybrid_ensemble",
+                    "temperature": float(self.calibrator.temperature_history[-1] if self.calibrator.temperature_history else temperature)
+                })
+                
+                # Add used numbers to sets
+                used_main_numbers.update(main_numbers)
+                used_bonus_numbers.update(bonus_numbers)
+                
+                # Clean memory occasionally
+                if draw_idx > 0 and draw_idx % CLEAN_MEMORY_FREQUENCY == 0:
+                    Utilities.clean_memory()
                     
-                    if idx == 0 or pred_seq_length == main_predictor.sequence_length:
-                        # Use the same sequence data as main predictor
-                        main_seq = main_predictor.main_sequences[-1:]
-                        bonus_seq = main_predictor.bonus_sequences[-1:]
-                    else:
-                        # We need to use appropriate sequence length for this model
-                        # This is handled by accessing the right indices from the processor
-                        # Note: In practice, you might need to create sequences of the right length
-                        # This is a simplification for demonstration
-                        main_seq = main_predictor.main_sequences[-1:, -pred_seq_length:, :]
-                        bonus_seq = main_predictor.bonus_sequences[-1:, -pred_seq_length:, :]
-                    
-                    # Predict main numbers
-                    model_main_probs = predictor.model.main_model.predict([latest_features, main_seq], verbose=0)
-                    
-                    # Apply model weight to these probabilities
-                    weight = model_weights.get(idx, 1.0)
-                    total_weight += weight
-                    
-                    for i in range(MAIN_NUM_COUNT):
-                        main_probs[i] += model_main_probs[i] * weight
-                    
-                    # Predict bonus numbers
-                    model_bonus_probs = predictor.model.bonus_model.predict([latest_features, bonus_seq], verbose=0)
-                    for i in range(BONUS_NUM_COUNT):
-                        bonus_probs[i] += model_bonus_probs[i] * weight
-                        
-                except Exception as e:
-                    logger.warning(f"Error getting ensemble predictions from model {idx}: {e}")
-                    continue
-            
-            # Make sure we have at least one valid model prediction
-            if total_weight == 0:
-                logger.error("No valid ensemble models for prediction")
-                return main_predictor.generate_fallback_predictions(num_draws)
-            
-            # Normalize the probabilities by total weight
-            for i in range(MAIN_NUM_COUNT):
-                main_probs[i] /= total_weight
-            
-            for i in range(BONUS_NUM_COUNT):
-                bonus_probs[i] /= total_weight
-            
-            # Calculate confidence for dynamic temperature
-            main_confidence = np.mean([np.max(main_probs[i][0]) for i in range(MAIN_NUM_COUNT)])
-            bonus_confidence = np.mean([np.max(bonus_probs[i][0]) for i in range(BONUS_NUM_COUNT)])
-            overall_confidence = (main_confidence + bonus_confidence) / 2
-            
-            # Apply dynamic temperature based on confidence
-            dynamic_temp = Utilities.calculate_dynamic_temperature(overall_confidence, 
-                                                                 min_temp=MIN_TEMPERATURE,
-                                                                 max_temp=MAX_TEMPERATURE)
-            
-            # Use original temperature for first draw, then use dynamic temperature
-            actual_temp = temperature if draw_idx == 0 else dynamic_temp
-            
-            # Sample main numbers with diversity handling
-            main_numbers = Utilities.sample_numbers(
-                probs=main_probs,
-                available_nums=range(MAIN_NUM_MIN, MAIN_NUM_MAX+1),
-                num_to_select=MAIN_NUM_COUNT,
-                used_nums=used_main_numbers,
-                diversity_sampling=diversity_sampling,
-                draw_idx=draw_idx,
-                temperature=actual_temp,
-                confidence=overall_confidence
-            )
-            
-            # Sample bonus numbers
-            bonus_numbers = Utilities.sample_numbers(
-                probs=bonus_probs,
-                available_nums=range(BONUS_NUM_MIN, BONUS_NUM_MAX+1),
-                num_to_select=BONUS_NUM_COUNT,
-                used_nums=used_bonus_numbers,
-                diversity_sampling=diversity_sampling,
-                draw_idx=draw_idx,
-                temperature=actual_temp,
-                confidence=overall_confidence
-            )
-            
-            # Store position information for evaluation metrics
-            main_positions = {num: idx for idx, num in enumerate(main_numbers)}
-            
-            # Calibrate confidence scores with proper scaling
-            calibrated_main_conf = MAIN_CONF_SCALE * main_confidence + MAIN_CONF_OFFSET
-            calibrated_bonus_conf = BONUS_CONF_SCALE * bonus_confidence + BONUS_CONF_OFFSET
-            
-            # Add pattern and frequency scores
-            pattern_score = Utilities.calculate_pattern_score(main_numbers, bonus_numbers)
-            frequency_score = Utilities.calculate_frequency_score(
-                main_numbers, bonus_numbers, main_predictor.processor.data
-            )
-            
-            # Overall confidence with ensemble bonus - ensemble predictions are typically more reliable
-            ensemble_bonus = 0.05  # Small bonus for ensemble predictions
-            overall_confidence = ((calibrated_main_conf + calibrated_bonus_conf) / 2 + 
-                                pattern_score + frequency_score) / 3 + ensemble_bonus
-            
-            predictions.append({
-                "main_numbers": main_numbers,
-                "main_number_positions": main_positions,
-                "bonus_numbers": bonus_numbers,
-                "confidence": {
-                    "overall": float(min(1.0, overall_confidence)),  # Cap at 1.0
-                    "main_numbers": float(calibrated_main_conf),
-                    "bonus_numbers": float(calibrated_bonus_conf),
-                    "pattern_score": float(pattern_score),
-                    "frequency_score": float(frequency_score)
-                },
-                "method": "ensemble",
-                "model_count": len(self.base_predictors),
-                "temperature": float(actual_temp)
-            })
-            
-            # Clean memory less frequently
-            if draw_idx > 0 and (draw_idx % CLEAN_MEMORY_FREQUENCY) == 0:
-                Utilities.clean_memory()
+            except Exception as e:
+                logger.error(f"Error generating prediction {draw_idx+1}: {e}")
+                logger.error(traceback.format_exc())
+                
+                # Generate a fallback prediction for this draw
+                fallback_pred = self._generate_single_fallback_prediction(draw_idx)
+                if fallback_pred:
+                    predictions.append(fallback_pred)
         
+        logger.info(f"Generated {len(predictions)} predictions successfully")
         return predictions
-    
-    def _calculate_model_weights(self):
-        """Calculate weights for ensemble models based on validation performance."""
-        weights = {}
-        
-        # If we have no models or just one, use equal weights
-        if len(self.base_predictors) <= 1:
-            weights = {0: 1.0}
-            return weights
-            
+
+    def _generate_single_fallback_prediction(self, draw_idx=0):
+        """Generate a single fallback prediction."""
         try:
-            # Get validation losses from each model if available
-            val_losses = []
-            
-            for idx, predictor in enumerate(self.base_predictors):
-                if predictor.model is None:
-                    val_losses.append(None)
-                    continue
+            # Try to generate a reasonable prediction based on historical data
+            if self.processor.data is not None and not self.processor.data.empty:
+                # Calculate historical frequencies
+                main_counts = np.zeros(MAIN_NUM_MAX)
+                bonus_counts = np.zeros(BONUS_NUM_MAX)
                 
-                # Try to get validation loss
-                main_history_file = "main_model_history.json"
-                model_val_loss = None
+                for _, row in self.processor.data.iterrows():
+                    for num in row["main_numbers"]:
+                        if MAIN_NUM_MIN <= num <= MAIN_NUM_MAX:
+                            main_counts[num-1] += 1
+                    for num in row["bonus_numbers"]:
+                        if BONUS_NUM_MIN <= num <= BONUS_NUM_MAX:
+                            bonus_counts[num-1] += 1
                 
-                try:
-                    if os.path.exists(main_history_file):
-                        with open(main_history_file, 'r') as f:
-                            history = json.load(f)
-                            if "val_loss" in history and history["val_loss"]:
-                                # Get the best (lowest) validation loss
-                                model_val_loss = min(history["val_loss"])
-                except Exception:
-                    # If loading fails, assign None
-                    model_val_loss = None
+                # Add recency bias - more recent draws get higher weight
+                recent_draws = min(30, len(self.processor.data))
+                for i in range(recent_draws):
+                    idx = len(self.processor.data) - i - 1
+                    weight = 2.0 * (recent_draws - i) / recent_draws
+                    
+                    row = self.processor.data.iloc[idx]
+                    for num in row["main_numbers"]:
+                        if MAIN_NUM_MIN <= num <= MAIN_NUM_MAX:
+                            main_counts[num-1] += weight
+                    for num in row["bonus_numbers"]:
+                        if BONUS_NUM_MIN <= num <= BONUS_NUM_MAX:
+                            bonus_counts[num-1] += weight
                 
-                val_losses.append(model_val_loss)
-            
-            # Remove None values
-            val_losses = [x for x in val_losses if x is not None]
-            
-            # If we have no valid losses, use equal weights
-            if not val_losses:
-                for idx in range(len(self.base_predictors)):
-                    weights[idx] = 1.0
-                return weights
-            
-            # Calculate weights inversely proportional to validation loss
-            # First, invert losses (lower loss = higher weight)
-            mean_loss = np.mean(val_losses)
-            inverted_losses = [mean_loss / max(val, 0.0001) for val in val_losses]
-            
-            # Normalize to sum to the number of models for proper averaging
-            total_inverted = sum(inverted_losses)
-            if total_inverted > 0:
-                model_count = len(self.base_predictors)
-                normalized_weights = [model_count * inv / total_inverted for inv in inverted_losses]
+                # Normalize to probabilities
+                main_probs = main_counts / np.sum(main_counts) if np.sum(main_counts) > 0 else np.ones(MAIN_NUM_MAX) / MAIN_NUM_MAX
+                bonus_probs = bonus_counts / np.sum(bonus_counts) if np.sum(bonus_counts) > 0 else np.ones(BONUS_NUM_MAX) / BONUS_NUM_MAX
+                
+                # Add small random noise for diversity
+                main_probs += np.random.random(MAIN_NUM_MAX) * 0.2 * np.mean(main_probs)
+                bonus_probs += np.random.random(BONUS_NUM_MAX) * 0.2 * np.mean(bonus_probs)
+                
+                # Renormalize
+                main_probs = main_probs / np.sum(main_probs)
+                bonus_probs = bonus_probs / np.sum(bonus_probs)
+                
+                # Sample numbers using the utility function
+                main_numbers = Utilities.sample_numbers(
+                    probs=[main_probs.reshape(1, -1)],
+                    available_nums=range(MAIN_NUM_MIN, MAIN_NUM_MAX+1),
+                    num_to_select=MAIN_NUM_COUNT,
+                    temperature=DEFAULT_TEMPERATURE + (draw_idx * 0.1)  # Increase temperature for diversity
+                )
+                
+                bonus_numbers = Utilities.sample_numbers(
+                    probs=[bonus_probs.reshape(1, -1)],
+                    available_nums=range(BONUS_NUM_MIN, BONUS_NUM_MAX+1),
+                    num_to_select=BONUS_NUM_COUNT,
+                    temperature=DEFAULT_TEMPERATURE + (draw_idx * 0.1)
+                )
+                
+                # Calculate pattern score
+                pattern_score = Utilities.calculate_pattern_score(main_numbers, bonus_numbers)
+                
+                # Calculate frequency score
+                frequency_score = Utilities.calculate_frequency_score(
+                    main_numbers, bonus_numbers, self.processor.data
+                )
+                
+                # Store position information
+                main_positions = {num: idx for idx, num in enumerate(main_numbers)}
+                
+                # Create prediction with reasonable confidence
+                return {
+                    "main_numbers": main_numbers,
+                    "main_number_positions": main_positions,
+                    "bonus_numbers": bonus_numbers,
+                    "confidence": {
+                        "overall": 0.4,
+                        "main_numbers": 0.45,
+                        "bonus_numbers": 0.35,
+                        "pattern_score": float(pattern_score),
+                        "frequency_score": float(frequency_score)
+                    },
+                    "method": "fallback_frequency",
+                    "temperature": DEFAULT_TEMPERATURE + (draw_idx * 0.1)
+                }
             else:
-                # Fallback to equal weights
-                normalized_weights = [1.0] * len(val_losses)
-            
-            # Assign weights to valid models
-            valid_idx = 0
-            for idx, predictor in enumerate(self.base_predictors):
-                if predictor.model is not None:
-                    if valid_idx < len(normalized_weights):
-                        weights[idx] = normalized_weights[valid_idx]
-                        valid_idx += 1
-                    else:
-                        weights[idx] = 1.0  # Fallback
-            
-        except Exception as e:
-            logger.warning(f"Error calculating model weights: {e}")
-            # Fallback to equal weights
-            for idx in range(len(self.base_predictors)):
-                weights[idx] = 1.0
+                # Pure random if no historical data
+                main_numbers = sorted(random.sample(range(MAIN_NUM_MIN, MAIN_NUM_MAX+1), MAIN_NUM_COUNT))
+                bonus_numbers = sorted(random.sample(range(BONUS_NUM_MIN, BONUS_NUM_MAX+1), BONUS_NUM_COUNT))
                 
-        return weights
+                # Calculate pattern score
+                pattern_score = Utilities.calculate_pattern_score(main_numbers, bonus_numbers)
+                
+                # Store position information
+                main_positions = {num: idx for idx, num in enumerate(main_numbers)}
+                
+                return {
+                    "main_numbers": main_numbers,
+                    "main_number_positions": main_positions, 
+                    "bonus_numbers": bonus_numbers,
+                    "confidence": {
+                        "overall": 0.2,
+                        "main_numbers": 0.2,
+                        "bonus_numbers": 0.2,
+                        "pattern_score": float(pattern_score),
+                        "frequency_score": 0.2
+                    },
+                    "method": "fallback_random",
+                    "temperature": 1.0
+                }
+        except Exception as e:
+            logger.error(f"Error in fallback prediction: {e}")
+            return None
+    
+    def generate_fallback_predictions(self, num_draws=5):
+        """Generate fallback predictions when models are not available."""
+        logger.warning("Using fallback prediction method")
+        
+        predictions = []
+        for i in range(num_draws):
+            pred = self._generate_single_fallback_prediction(i)
+            if pred:
+                predictions.append(pred)
+                
+        return predictions
 
 #######################
 # HYPERPARAMETER OPTIMIZATION
@@ -2553,69 +4068,128 @@ class HyperparameterOptimizer:
         self.n_trials = n_trials
         self.study = None
         self.best_params = None
-        self.evaluator = None
-        self.data_cache = None  # Cache for data reuse across trials
+        self.data_cache = None  # Cache for data reuse
     
     @ErrorHandler.handle_exception(logger, "optimization trial")
     def objective(self, trial):
-        """Objective function for hyperparameter optimization with expanded search space."""
+        """Objective function for hyperparameter optimization."""
         # Define expanded parameter ranges
         params = {
+            # Learning rate with finer granularity
             'learning_rate': trial.suggest_float('learning_rate', 0.0001, 0.003, log=True),
-            'batch_size': trial.suggest_categorical('batch_size', [16, 32, 64]),
-            'dropout_rate': trial.suggest_float('dropout_rate', 0.1, 0.5),
-            'num_heads': trial.suggest_categorical('num_heads', [2, 3, 4, 8]),
-            'ff_dim': trial.suggest_categorical('ff_dim', [64, 96, 128, 192, 256]),
-            'embed_dim': trial.suggest_categorical('embed_dim', [32, 48, 64, 96, 128]),
+            
+            # More batch size options
+            'batch_size': trial.suggest_categorical('batch_size', [16, 24, 32, 48, 64, 96]),
+            
+            # More granular dropout options
+            'dropout_rate': trial.suggest_float('dropout_rate', 0.1, 0.5, step=0.05),
+            
+            # Expanded attention head options
+            'num_heads': trial.suggest_categorical('num_heads', [2, 3, 4, 6, 8, 12]),
+            
+            # More feed-forward dimension options
+            'ff_dim': trial.suggest_categorical('ff_dim', [64, 96, 128, 160, 192, 224, 256, 320]),
+            
+            # More embedding dimension options
+            'embed_dim': trial.suggest_categorical('embed_dim', [32, 48, 64, 80, 96, 112, 128, 144]),
+            
+            # GRU usage
             'use_gru': trial.suggest_categorical('use_gru', [True, False]),
-            # Fix 1: Ensure conv_filters is at least 1
-            'conv_filters': trial.suggest_int('conv_filters', 1, 64, step=16),  # Changed minimum from 0 to 1
-            'num_transformer_blocks': trial.suggest_int('num_transformer_blocks', 1, 3),
-            'optimizer': trial.suggest_categorical('optimizer', ['adam', 'rmsprop', 'sgd']),
-            # Fix 2: Fix sequence length to match data preparation
-            'sequence_length': 20,  # Fixed to 20 instead of varying
-            'l2_regularization': trial.suggest_float('l2_regularization', 1e-5, 1e-3, log=True),
-            'model_type': trial.suggest_categorical('model_type', ['transformer', 'lstm', 'rnn']),
+            
+            # More granular conv filter options
+            'conv_filters': trial.suggest_int('conv_filters', 8, 64, step=8),
+            
+            # More transformer block options
+            'num_transformer_blocks': trial.suggest_int('num_transformer_blocks', 1, 4),
+            
+            # Additional optimizer options
+            'optimizer': trial.suggest_categorical('optimizer', ['adam', 'rmsprop', 'sgd', 'adamw']),
+            
+            # More sequence length options
+            'sequence_length': trial.suggest_categorical('sequence_length', [12, 16, 20, 24, 28, 32]),
+            
+            # More regularization options
+            'l2_regularization': trial.suggest_float('l2_regularization', 1e-6, 1e-3, log=True),
+            
+            # Include additional model types
+            'model_type': trial.suggest_categorical('model_type', ['transformer', 'lstm', 'rnn', 'hybrid']),
+            
+            # Architecture options
             'use_residual': trial.suggest_categorical('use_residual', [True, False]),
             'use_layer_scaling': trial.suggest_categorical('use_layer_scaling', [True, False]),
-            'min_delta': trial.suggest_float('min_delta', 0.0005, 0.005, log=True)
+            
+            # Early stopping control
+            'min_delta': trial.suggest_float('min_delta', 0.0001, 0.005, log=True),
+            
+            # Model component usage
+            'use_frequency_model': trial.suggest_categorical('use_frequency_model', [True, False]),
+            'use_pattern_model': trial.suggest_categorical('use_pattern_model', [True, False]),
+            'use_transformer_model': trial.suggest_categorical('use_transformer_model', [True, True, False]),  # 2/3 chance of using transformer
         }
         
         # Add model-specific parameters based on model type
         if params['model_type'] == 'lstm':
+            params['lstm_units'] = trial.suggest_categorical('lstm_units', [24, 32, 48, 64, 96, 128])
+        elif params['model_type'] == 'hybrid':
             params['lstm_units'] = trial.suggest_categorical('lstm_units', [24, 32, 48, 64])
+            params['gru_units'] = trial.suggest_categorical('gru_units', [24, 32, 48, 64])
         
-        # Reuse the same evaluator for all trials to avoid reloading data
-        if self.evaluator is None:
-            # Initialize with shared data cache if available
-            self.evaluator = CrossValidationEvaluator(self.file_path, params=None, folds=3, data_cache=self.data_cache)
-            # Store data cache for future use
-            if self.data_cache is None:
-                self.data_cache = self.evaluator.data_cache
-        else:
-            # Update evaluator parameters for this trial
-            self.evaluator.params = params
-        
-        # Run evaluation with multiple metrics
-        results = self.evaluator.evaluate()
-        
-        # Use a balanced objective considering both accuracy and partial matches
-        trial_accuracy = results['avg_overall_accuracy']
-        partial_match_score = results.get('avg_partial_match_score', 0)
-        
-        # Combined objective for optimization (70% accuracy, 30% partial matches)
-        combined_score = 0.7 * trial_accuracy + 0.3 * partial_match_score
-        
-        # Store additional metrics in the trial
-        trial.set_user_attr('accuracy', float(trial_accuracy))
-        trial.set_user_attr('partial_match', float(partial_match_score))
-        trial.set_user_attr('main_accuracy', float(results['avg_main_accuracy']))
-        trial.set_user_attr('bonus_accuracy', float(results['avg_bonus_accuracy']))
-        
-        # Clean up memory
-        Utilities.clean_memory()
-        
-        return combined_score
+        try:
+            # Initialize hybrid system with these parameters
+            system = HybridNeuralSystem(self.file_path, params=params)
+            
+            # Reuse data cache if available
+            if self.data_cache is not None:
+                # Apply cached data
+                system.features = self.data_cache['features']
+                system.features_scaled = self.data_cache['features_scaled']
+                system.processor.data = self.data_cache['data']
+                
+                # Only reuse sequence data if the sequence length matches
+                if self.data_cache.get('sequence_length') == params['sequence_length']:
+                    system.main_sequences = self.data_cache['main_sequences']
+                    system.bonus_sequences = self.data_cache['bonus_sequences']
+                    system.y_main = self.data_cache['y_main']
+                    system.y_bonus = self.data_cache['y_bonus']
+                    system.y_main_raw = self.data_cache['y_main_raw']
+                    system.y_bonus_raw = self.data_cache['y_bonus_raw']
+                else:
+                    # Set the correct sequence length and regenerate sequences
+                    system.processor.set_sequence_length(params['sequence_length'])
+                    data_dict = system.prepare_data()
+                    
+                    # Update cache with new sequence data
+                    self.data_cache['sequence_length'] = params['sequence_length']
+                    self.data_cache.update(data_dict)
+            else:
+                # Prepare data and cache it
+                data_dict = system.prepare_data()
+                data_dict['sequence_length'] = params['sequence_length']  # Store sequence_length in cache
+                self.data_cache = data_dict
+            
+            # Build models
+            system.build_models()
+            
+            # Calculate metrics through cross-validation
+            evaluator = CrossValidationEvaluator(system, folds=3)
+            scores = evaluator.evaluate()
+            
+            # Use a balanced objective considering both accuracy and pattern score
+            trial_score = scores['avg_overall_acc'] * 0.6 + scores['avg_pattern_score'] * 0.4
+            
+            # Store additional metrics in the trial
+            trial.set_user_attr('accuracy', float(scores['avg_overall_acc']))
+            trial.set_user_attr('pattern_score', float(scores['avg_pattern_score']))
+            
+            # Clean memory
+            Utilities.clean_memory()
+            
+            return trial_score
+            
+        except Exception as e:
+            logger.error(f"Error in trial: {e}")
+            # Return a very low score for failed trials
+            return -1.0
     
     @ErrorHandler.handle_exception(logger, "hyperparameter optimization", Utilities.get_default_params())
     def optimize(self):
@@ -2625,8 +4199,8 @@ class HyperparameterOptimizer:
         # Create Optuna study with improved configuration
         self.study = optuna.create_study(
             direction="maximize",
-            sampler=TPESampler(seed=RANDOM_SEED, n_startup_trials=10),
-            pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=10)
+            sampler=TPESampler(seed=RANDOM_SEED, n_startup_trials=25),  # Increased from 10
+            pruner=MedianPruner(n_startup_trials=10, n_warmup_steps=20)  # Relaxed parameters
         )
         
         # Run optimization
@@ -2640,9 +4214,36 @@ class HyperparameterOptimizer:
         # Add derived parameters that may be missing
         if 'lstm_units' not in self.best_params and self.best_params.get('model_type') == 'lstm':
             self.best_params['lstm_units'] = 32  # Default value
+        
+        # Set reasonable ensemble weights based on which models are enabled
+        ensemble_weights = {}
+        models_enabled = 0
+        
+        if self.best_params.get('use_transformer_model', True):
+            ensemble_weights['transformer'] = 0.4
+            models_enabled += 1
+        
+        if self.best_params.get('use_frequency_model', True):
+            ensemble_weights['frequency'] = 0.3
+            models_enabled += 1
+        
+        if self.best_params.get('use_pattern_model', True):
+            ensemble_weights['pattern'] = 0.3
+            models_enabled += 1
             
+        # Adjust weights if not all models are enabled
+        if models_enabled < 3:
+            weight_sum = sum(ensemble_weights.values())
+            if weight_sum > 0:
+                ensemble_weights = {k: v / weight_sum for k, v in ensemble_weights.items()}
+                
+        self.best_params['ensemble_weights'] = ensemble_weights
+            
+        # Save best parameters to file
+        Utilities.save_params(self.best_params, "hybrid_best_params.json")
+        
         return self.best_params
-    
+
     @ErrorHandler.handle_exception(logger, "optimization plotting", None)
     def plot_optimization_history(self, filename="optimization_history.png"):
         """Plot optimization history with enhanced visualization."""
@@ -2650,8 +4251,8 @@ class HyperparameterOptimizer:
             logger.error("No optimization study. Call optimize() first.")
             return None
         
-        # Create figure with three subplots
-        plt.figure(figsize=(18, 12))
+        # Create figure with subplots
+        plt.figure(figsize=(16, 12))
         
         # 1. Plot optimization history
         plt.subplot(2, 2, 1)
@@ -2679,114 +4280,56 @@ class HyperparameterOptimizer:
         # 2. Plot parameter importances
         plt.subplot(2, 2, 2)
         
-        # Calculate parameter importances manually
-        importances = {}
-        for param_name in self.best_params.keys():
-            try:
-                param_values = []
-                param_scores = []
-                
-                # Collect all values for this parameter
-                for trial in self.study.trials:
-                    if trial.state == optuna.trial.TrialState.COMPLETE and param_name in trial.params:
-                        param_values.append(trial.params[param_name])
-                        param_scores.append(trial.value)
-                
-                # Calculate variance of scores for different parameter values
-                unique_values = list(set(param_values))
-                if len(unique_values) > 1:
-                    # Calculate mean score for each unique value
-                    value_scores = {value: [] for value in unique_values}
-                    for value, score in zip(param_values, param_scores):
-                        value_scores[value].append(score)
-                    
-                    mean_scores = [np.mean(value_scores[value]) for value in unique_values]
-                    importance = np.var(mean_scores)
-                    importances[param_name] = importance
-            except Exception:
-                continue
-        
-        # Sort parameters by importance
-        sorted_importances = sorted(importances.items(), key=lambda x: x[1], reverse=True)
-        
-        # Plot top 10 parameters
-        top_params = sorted_importances[:10]
-        param_names = [param[0] for param in top_params]
-        importance_values = [param[1] for param in top_params]
-        
-        # Normalize importances for better visualization
-        if importance_values:
-            importance_values = [value / max(importance_values) for value in importance_values]
+        # Calculate parameter importances if possible
+        try:
+            importances = optuna.importance.get_param_importances(self.study)
+            param_names = list(importances.keys())
+            importance_values = list(importances.values())
             
-        plt.barh(param_names, importance_values)
-        plt.xlabel('Relative Importance')
-        plt.title('Parameter Importances')
-        plt.grid(alpha=0.3)
+            # Plot top 10 parameters
+            if param_names:
+                plt.barh(param_names[-10:], importance_values[-10:])
+                plt.xlabel('Relative Importance')
+                plt.title('Parameter Importances')
+                plt.grid(alpha=0.3)
+        except Exception as e:
+            plt.text(0.5, 0.5, f"Could not calculate parameter importances:\n{str(e)}",
+                    ha='center', va='center', fontsize=12)
         
-        # 3. Plot accuracy metrics
+        # 3. Plot validation accuracy
         plt.subplot(2, 2, 3)
         
         # Extract metrics
-        accuracies = [t.user_attrs.get('accuracy', 0) for t in self.study.trials 
-                      if t.state == optuna.trial.TrialState.COMPLETE]
-        main_accuracies = [t.user_attrs.get('main_accuracy', 0) for t in self.study.trials 
-                           if t.state == optuna.trial.TrialState.COMPLETE]
-        bonus_accuracies = [t.user_attrs.get('bonus_accuracy', 0) for t in self.study.trials 
-                            if t.state == optuna.trial.TrialState.COMPLETE]
-        partial_matches = [t.user_attrs.get('partial_match', 0) for t in self.study.trials 
-                           if t.state == optuna.trial.TrialState.COMPLETE]
+        accuracies = [t.user_attrs.get('accuracy', float('nan')) for t in self.study.trials 
+                     if t.state == optuna.trial.TrialState.COMPLETE]
+        pattern_scores = [t.user_attrs.get('pattern_score', float('nan')) for t in self.study.trials 
+                         if t.state == optuna.trial.TrialState.COMPLETE]
         
         # Plot metrics over trials
-        plt.plot(trial_numbers, accuracies, 'b-', alpha=0.7, label='Overall Accuracy')
-        plt.plot(trial_numbers, main_accuracies, 'g-', alpha=0.7, label='Main Accuracy')
-        plt.plot(trial_numbers, bonus_accuracies, 'm-', alpha=0.7, label='Bonus Accuracy')
-        plt.plot(trial_numbers, partial_matches, 'c-', alpha=0.7, label='Partial Match Score')
+        plt.plot(trial_numbers, accuracies, 'b-', alpha=0.7, label='Accuracy')
+        plt.plot(trial_numbers, pattern_scores, 'g-', alpha=0.7, label='Pattern Score')
         plt.xlabel('Trial Number')
-        plt.ylabel('Score')
-        plt.title('Performance Metrics')
+        plt.ylabel('Metric Value')
+        plt.title('Validation Metrics')
         plt.legend()
         plt.grid(alpha=0.3)
         
-        # 4. Plot parameter distributions for best trials
+        # 4. Plot parallel coordinate plot for top trials
         plt.subplot(2, 2, 4)
         
-        # Get top 5 trials
-        top_trials = sorted(self.study.trials, key=lambda t: t.value if t.value is not None else float('-inf'), reverse=True)[:5]
+        try:
+            # Get most important parameters
+            important_params = list(importances.keys())[:5]
+            optuna.visualization.matplotlib.plot_parallel_coordinate(
+                self.study, 
+                params=important_params
+            )
+            plt.title('Parallel Coordinate Plot')
+        except Exception as e:
+            plt.text(0.5, 0.5, f"Could not create parallel coordinate plot:\n{str(e)}",
+                    ha='center', va='center', fontsize=12)
         
-        # Select a subset of important parameters to visualize
-        key_params = ['model_type', 'learning_rate', 'dropout_rate', 'sequence_length']
-        
-        # Create a table-like visualization
-        cell_text = []
-        for trial in top_trials:
-            row = [f"Trial {trial.number}"]
-            for param in key_params:
-                if param in trial.params:
-                    value = trial.params[param]
-                    # Format float values
-                    if isinstance(value, float):
-                        row.append(f"{value:.5f}")
-                    else:
-                        row.append(str(value))
-                else:
-                    row.append("N/A")
-            row.append(f"{trial.value:.5f}")
-            cell_text.append(row)
-        
-        # Create table
-        plt.axis('off')
-        table = plt.table(
-            cellText=cell_text,
-            colLabels=["Trial"] + key_params + ["Score"],
-            loc='center',
-            cellLoc='center',
-            colWidths=[0.15] * (len(key_params) + 2)
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(9)
-        table.scale(1.2, 1.5)
-        plt.title('Top 5 Trials')
-        
+        # Save figure
         plt.tight_layout()
         plt.savefig(filename, dpi=300)
         plt.close()
@@ -2795,42 +4338,27 @@ class HyperparameterOptimizer:
         return filename
 
 class CrossValidationEvaluator:
-    """Enhanced evaluator for time-series cross validation of lottery prediction."""
+    """Evaluate model performance using time-series cross-validation."""
     
-    def __init__(self, file_path, params=None, folds=5, data_cache=None):
-        """Initialize the cross-validation evaluator."""
-        self.file_path = file_path
-        self.params = params if params is not None else Utilities.get_default_params()
+    def __init__(self, system, folds=5):
+        """Initialize with a hybrid system instance."""
+        self.system = system
         self.folds = folds
-        self.data_dict = None
-        self.system = None
-        self.data_cache = data_cache  # For reusing data across trials
     
     @ErrorHandler.handle_exception(logger, "cross-validation", {
-        'fold_metrics': [], 'avg_main_accuracy': 0.0, 
-        'avg_bonus_accuracy': 0.0, 'avg_overall_accuracy': 0.0,
-        'avg_partial_match_score': 0.0
+        'fold_metrics': [], 'avg_overall_acc': 0.0, 
+        'avg_pattern_score': 0.0, 'avg_score': 0.0
     })
     def evaluate(self):
-        """Perform time-series cross-validation with enhanced metrics."""
+        """Perform time-series cross-validation with enhanced scoring."""
         logger.info(f"Performing {self.folds}-fold time-series cross-validation")
         
-        # Create predictor system and prepare data once - reuse data if cached
-        if self.data_cache is not None:
-            self.data_dict = self.data_cache
-            logger.info("Using cached data for evaluation")
-        elif self.system is None or self.data_dict is None:
-            # Initialize system with sequence length from parameters
-            self.system = LotteryPredictionSystem(self.file_path, self.params)
-            self.data_dict = self.system.prepare_data()
-            # Store for later reuse
-            self.data_cache = self.data_dict
-        else:
-            # Update parameters if they've changed
-            self.system.params = self.params
+        # Ensure data is prepared
+        if self.system.features_scaled is None:
+            self.system.prepare_data()
         
-        # Calculate total data size and validate
-        total_samples = len(self.data_dict["X"])
+        # Check if we have enough data
+        total_samples = len(self.system.features_scaled)
         if total_samples < self.folds * 2:
             logger.warning(f"Not enough data ({total_samples} samples) for {self.folds} folds")
             # Adjust folds to a reasonable number
@@ -2838,647 +4366,260 @@ class CrossValidationEvaluator:
             logger.info(f"Adjusted to {self.folds} folds")
             
         fold_size = total_samples // self.folds
-    
+        
         # Initialize metrics
         fold_metrics = []
         
-        # Use time-series cross-validation with forward chaining
-        # This ensures proper temporal ordering is maintained
-        for fold in range(self.folds - 1):  # Last fold is reserved for testing
+        # Prepare arrays for all data
+        X_features = self.system.features_scaled.values if hasattr(self.system.features_scaled, 'values') else self.system.features_scaled
+        main_sequences = self.system.main_sequences
+        bonus_sequences = self.system.bonus_sequences
+        y_main = self.system.y_main
+        y_main_raw = self.system.y_main_raw
+        
+        # Use time-series cross-validation (each fold uses only past data)
+        for fold in range(self.folds):
             try:
-                logger.info(f"Training fold {fold+1}/{self.folds}")
+                # Calculate test split for this fold
+                test_start = fold * fold_size
+                test_end = min((fold + 1) * fold_size, total_samples)
                 
-                # Calculate fold indices for forward chaining
-                # Each fold uses all previous data for training
-                train_end = (fold + 1) * fold_size
-                test_start = train_end
-                test_end = min(test_start + fold_size, total_samples)
+                # For first fold, we can't have a training set (need at least 1 sample)
+                if test_start == 0:
+                    test_start = 1
                 
-                # Validate indices
-                if train_end <= 0 or test_start >= test_end or test_start >= total_samples:
-                    logger.warning(f"Invalid fold indices: train end={train_end}, test={test_start}:{test_end} (total: {total_samples})")
-                    continue
-                
-                # Split data for this fold
-                train_indices = list(range(0, train_end))
+                # Calculate training indices (all data before test split)
+                train_indices = list(range(0, test_start))
                 test_indices = list(range(test_start, test_end))
                 
-                if len(train_indices) < 10 or len(test_indices) < 2:
-                    logger.warning(f"Fold {fold+1} has insufficient samples: {len(train_indices)} train, {len(test_indices)} test")
+                # Skip if we don't have enough data
+                if len(train_indices) < 5 or len(test_indices) < 2:
+                    logger.info(f"Skipping fold {fold+1} due to insufficient data")
                     continue
                 
                 # Extract data for this fold
-                X_train = self.data_dict["X"][train_indices]
-                X_test = self.data_dict["X"][test_indices]
+                X_train = X_features[train_indices]
+                X_test = X_features[test_indices]
                 
-                main_seq_train = self.data_dict["main_sequences"][train_indices]
-                main_seq_test = self.data_dict["main_sequences"][test_indices]
+                main_seq_train = main_sequences[train_indices]
+                main_seq_test = main_sequences[test_indices]
                 
-                bonus_seq_train = self.data_dict["bonus_sequences"][train_indices]
-                bonus_seq_test = self.data_dict["bonus_sequences"][test_indices]
+                y_main_train = y_main[train_indices]
+                y_main_test = y_main[test_indices]
                 
-                y_main_train = self.data_dict["y_main"][train_indices]
-                y_main_test = self.data_dict["y_main"][test_indices]
+                y_main_raw_train = y_main_raw[train_indices]
+                y_main_raw_test = y_main_raw[test_indices]
                 
-                y_bonus_train = self.data_dict["y_bonus"][train_indices]
-                y_bonus_test = self.data_dict["y_bonus"][test_indices]
+                # Train a transformer model for this fold
+                params = self.system.params.copy()
+                input_shape = (X_train.shape[1], main_sequences.shape[2])
                 
-                # Create model for this fold
-                model = LotteryModel(self.params)
-                sequence_length = self.params.get('sequence_length', DEFAULT_SEQUENCE_LENGTH)
-                model.build_models(X_train.shape[1], sequence_length)
+                # Create and train models
+                transformer_model = None
+                frequency_model = None
+                pattern_model = None
                 
-                # Train with reduced epochs for CV
-                model.train_models(
-                    X_train=X_train,
-                    main_seq_train=main_seq_train,
-                    bonus_seq_train=bonus_seq_train,
-                    y_main_train=y_main_train,
-                    y_bonus_train=y_bonus_train,
-                    epochs=30,  # Reduced epochs for CV
-                    validation_split=0.1
-                )
-                
-                # Evaluate on test set
-                main_preds = model.main_model.predict([X_test, main_seq_test], verbose=0)
-                bonus_preds = model.bonus_model.predict([X_test, bonus_seq_test], verbose=0)
-            
-                # Convert to class predictions (vectorized operation)
-                main_class_preds = [np.argmax(main_preds[i], axis=1) for i in range(MAIN_NUM_COUNT)]
-                bonus_class_preds = [np.argmax(bonus_preds[i], axis=1) for i in range(BONUS_NUM_COUNT)]
-                
-                # Calculate accuracy for each position (vectorized operation)
-                main_position_acc = [float(np.mean(main_class_preds[i] == y_main_test[:, i])) for i in range(MAIN_NUM_COUNT)]
-                bonus_position_acc = [float(np.mean(bonus_class_preds[i] == y_bonus_test[:, i])) for i in range(BONUS_NUM_COUNT)]
-                
-                # Calculate average accuracy
-                main_avg_acc = float(np.mean(main_position_acc))
-                bonus_avg_acc = float(np.mean(bonus_position_acc))
-                overall_avg_acc = float((main_avg_acc + bonus_avg_acc) / 2)
-                
-                # Calculate partial match score - new metric
-                partial_match_scores = []
-                
-                for i in range(len(test_indices)):
-                    # Create actual draw from test data
-                    actual_main = [int(y_main_test[i, j]) + 1 for j in range(MAIN_NUM_COUNT)]  # Add 1 to convert back to 1-indexed
-                    actual_bonus = [int(y_bonus_test[i, j]) + 1 for j in range(BONUS_NUM_COUNT)]
+                # Only train enabled models
+                if params.get('use_transformer_model', True):
+                    transformer_model = TransformerModel(input_shape, MAIN_NUM_MAX, params)
+                    transformer_model.build_model()
                     
-                    # Create prediction from model
-                    pred_main = [int(main_class_preds[j][i]) + 1 for j in range(MAIN_NUM_COUNT)]
-                    pred_bonus = [int(bonus_class_preds[j][i]) + 1 for j in range(BONUS_NUM_COUNT)]
+                    # Train with reduced epochs for CV
+                    transformer_model.train(
+                        X_train=(X_train, main_seq_train),
+                        y_train=y_main_train,
+                        epochs=20,  # Reduced epochs
+                        validation_split=0.1
+                    )
+                
+                if params.get('use_frequency_model', True):
+                    frequency_model = FrequencyModel()
+                    frequency_model.build_model()
+                    frequency_model.train(X_train, y_main_raw_train)
+                
+                if params.get('use_pattern_model', True):
+                    pattern_model = PatternModel()
+                    pattern_model.build_model()
+                    pattern_model.train(X_train, y_main_raw_train)
+                
+                # Predict on test set
+                predictions = []
+                
+                for i in range(len(X_test)):
+                    # Get predictions from each model
+                    model_probs = {}
                     
-                    # Create dictionaries for score calculation
-                    actual_draw = {
-                        "main_numbers": sorted(actual_main),
-                        "bonus_numbers": sorted(actual_bonus),
-                        "main_number_positions": {num: idx for idx, num in enumerate(actual_main)}
-                    }
+                    # Get transformer model predictions
+                    if transformer_model is not None:
+                        transformer_probs = transformer_model.predict((X_test[i:i+1], main_seq_test[i:i+1]))
+                        model_probs['transformer'] = transformer_probs
                     
+                    # Get frequency model predictions
+                    if frequency_model is not None:
+                        freq_probs = frequency_model.predict_probabilities(X_test[i:i+1])
+                        model_probs['frequency'] = freq_probs
+                    
+                    # Get pattern model predictions
+                    if pattern_model is not None:
+                        pattern_probs = pattern_model.predict_probabilities(X_test[i:i+1])
+                        model_probs['pattern'] = pattern_probs
+                    
+                    # Combine model predictions based on ensemble weights
+                    ensemble_weights = params.get('ensemble_weights', {
+                        'transformer': 0.4,
+                        'frequency': 0.3,
+                        'pattern': 0.3
+                    })
+                    
+                    # Adjust weights if models aren't available
+                    if transformer_model is None:
+                        ensemble_weights['transformer'] = 0
+                    if frequency_model is None:
+                        ensemble_weights['frequency'] = 0
+                    if pattern_model is None:
+                        ensemble_weights['pattern'] = 0
+                        
+                    # Normalize weights
+                    weight_sum = sum(ensemble_weights.values())
+                    if weight_sum > 0:
+                        ensemble_weights = {k: v / weight_sum for k, v in ensemble_weights.items()}
+                    
+                    # Create calibrator
+                    calibrator = EnsembleCalibrator()
+                    
+                    # Apply calibration
+                    ensemble_probs = calibrator.calibrate_ensemble(model_probs, None, 0)
+                    
+                    # Sample numbers
+                    main_numbers = Utilities.sample_numbers(
+                        probs=[ensemble_probs],
+                        available_nums=range(MAIN_NUM_MIN, MAIN_NUM_MAX+1),
+                        num_to_select=MAIN_NUM_COUNT,
+                        temperature=DEFAULT_TEMPERATURE
+                    )
+                    
+                    # Create position map for prediction
+                    main_positions = {num: idx for idx, num in enumerate(main_numbers)}
+                    
+                    # Get actual numbers and their positions
+                    actual_numbers = y_main_raw_test[i]
+                    actual_positions = {num: idx for idx, num in enumerate(actual_numbers)}
+                    
+                    # Generate a simple bonus number prediction
+                    bonus_probs = np.ones(BONUS_NUM_MAX) / BONUS_NUM_MAX  # Simple uniform distribution for CV
+                    bonus_numbers = Utilities.sample_numbers(
+                        probs=[bonus_probs.reshape(1, -1)],
+                        available_nums=range(BONUS_NUM_MIN, BONUS_NUM_MAX+1),
+                        num_to_select=BONUS_NUM_COUNT,
+                        temperature=DEFAULT_TEMPERATURE
+                    )
+                    
+                    # Get actual bonus numbers if available (or use empty list)
+                    actual_bonus = []  # We may not have actual bonus numbers in CV
+                    
+                    # Create prediction dict
                     prediction = {
-                        "main_numbers": sorted(pred_main),
-                        "bonus_numbers": sorted(pred_bonus),
-                        "main_number_positions": {num: idx for idx, num in enumerate(pred_main)}
+                        "main_numbers": main_numbers,
+                        "main_number_positions": main_positions,
+                        "bonus_numbers": bonus_numbers
+                    }
+              
+                    # Create actual draw dict
+                    actual_draw = {
+                        "main_numbers": actual_numbers,
+                        "main_number_positions": actual_positions,
+                        "bonus_numbers": actual_bonus
                     }
                     
-                    # Calculate score
-                    score = Utilities.calculate_partial_match_score(prediction, actual_draw)
-                    partial_match_scores.append(score)
+                    # Calculate partial match score - NEW CODE USING THE FUNCTION
+                    match_score = Utilities.calculate_partial_match_score(prediction, actual_draw)
+                    
+                    # Calculate pattern score
+                    pattern_score = Utilities.calculate_pattern_score(main_numbers)
+                    
+                    predictions.append({
+                        'predicted': main_numbers,
+                        'actual': actual_numbers,
+                        'partial_match_score': match_score,  # Store the new score
+                        'pattern_score': pattern_score
+                    })
                 
-                # Average partial match score
-                avg_partial_match = float(np.mean(partial_match_scores)) if partial_match_scores else 0.0
+                # Calculate fold metrics
+                if predictions:
+                    # Use the new partial match score instead of simple match rate
+                    avg_match_score = np.mean([p['partial_match_score'] for p in predictions])
+                    avg_pattern_score = np.mean([p['pattern_score'] for p in predictions])
+                    
+                    # Store metrics
+                    fold_metrics.append({
+                        'fold': fold + 1,
+                        'match_score': avg_match_score,  # Updated variable name
+                        'pattern_score': avg_pattern_score,
+                        'score': 0.7 * avg_match_score + 0.3 * avg_pattern_score
+                    })
+                    
+                    logger.info(f"Fold {fold+1}: Match Score = {avg_match_score:.4f}, Pattern Score = {avg_pattern_score:.4f}")
                 
-                # Store metrics
-                fold_metrics.append({
-                    'fold': fold+1,
-                    'main_accuracy': main_avg_acc,
-                    'bonus_accuracy': bonus_avg_acc,
-                    'overall_accuracy': overall_avg_acc,
-                    'partial_match_score': avg_partial_match,
-                    'main_position_acc': main_position_acc,
-                    'bonus_position_acc': bonus_position_acc
-                })
-                
-                logger.info(f"Fold {fold+1} metrics: Main acc={main_avg_acc:.4f}, Bonus acc={bonus_avg_acc:.4f}, Overall={overall_avg_acc:.4f}, Partial={avg_partial_match:.4f}")
-                
-                # Clean memory at a reasonable frequency
-                if fold % 2 == 1:  # Clean every other fold
-                    Utilities.clean_memory()
+                # Clean memory between folds
+                Utilities.clean_memory()
                 
             except Exception as e:
-                logger.error(f"Error processing fold {fold+1}: {e}")
-                # Add a placeholder with zero accuracy for this fold
-                fold_metrics.append({
-                    'fold': fold+1,
-                    'main_accuracy': 0.0,
-                    'bonus_accuracy': 0.0,
-                    'overall_accuracy': 0.0,
-                    'partial_match_score': 0.0,
-                    'error': str(e)
-                })
+                logger.error(f"Error evaluating fold {fold+1}: {e}")
+                logger.error(traceback.format_exc())
+                continue
         
-        # Calculate average metrics if we have any valid folds
+        # Calculate average metrics
         if fold_metrics:
-            avg_main_acc = float(np.mean([m['main_accuracy'] for m in fold_metrics]))
-            avg_bonus_acc = float(np.mean([m['bonus_accuracy'] for m in fold_metrics]))
-            avg_overall_acc = float(np.mean([m['overall_accuracy'] for m in fold_metrics]))
-            avg_partial_match = float(np.mean([m.get('partial_match_score', 0.0) for m in fold_metrics]))
+            avg_match_score = np.mean([m['match_score'] for m in fold_metrics])
+            avg_pattern_score = np.mean([m['pattern_score'] for m in fold_metrics])
+            avg_score = np.mean([m['score'] for m in fold_metrics])
         else:
-            avg_main_acc = 0.0
-            avg_bonus_acc = 0.0
-            avg_overall_acc = 0.0
-            avg_partial_match = 0.0
+            avg_match_score = 0.0
+            avg_pattern_score = 0.0
+            avg_score = 0.0
         
-        logger.info(f"Average metrics across {len(fold_metrics)} folds:")
-        logger.info(f"Main numbers accuracy: {avg_main_acc:.4f}")
-        logger.info(f"Bonus numbers accuracy: {avg_bonus_acc:.4f}")
-        logger.info(f"Overall accuracy: {avg_overall_acc:.4f}")
-        logger.info(f"Partial match score: {avg_partial_match:.4f}")
-        
-        # Clean memory after all folds
-        Utilities.clean_memory(force=True)
+        logger.info(f"Cross-validation complete:")
+        logger.info(f"  Average Match Score: {avg_match_score:.4f}")
+        logger.info(f"  Average Pattern Score: {avg_pattern_score:.4f}")
+        logger.info(f"  Average Combined Score: {avg_score:.4f}")
         
         return {
             'fold_metrics': fold_metrics,
-            'avg_main_accuracy': avg_main_acc,
-            'avg_bonus_accuracy': avg_bonus_acc,
-            'avg_overall_accuracy': avg_overall_acc,
-            'avg_partial_match_score': avg_partial_match
+            'avg_overall_acc': avg_match_score,  # Updated variable name (was match_rate)
+            'avg_pattern_score': avg_pattern_score,
+            'avg_score': avg_score
         }
-    
-#######################
-# UNIFIED PREDICTION SYSTEM
-#######################
-
-class LotteryPredictionSystem:
-    """Enhanced unified prediction system with optimized data processing and model management."""
-    
-    def __init__(self, file_path, params=None):
-        """Initialize the prediction system with proper sequence length handling."""
-        self.file_path = file_path
-        self.params = params if params is not None else Utilities.get_default_params()
-        
-        # Get sequence length from params if available
-        self.sequence_length = self.params.get('sequence_length', DEFAULT_SEQUENCE_LENGTH)
-        
-        # Initialize processor with the same sequence length
-        self.processor = LotteryDataProcessor(file_path)
-        self.processor.set_sequence_length(self.sequence_length)
-        
-        self.model = None
-        self.feature_scaler = StandardScaler()
-        self.X_scaled = None
-        self.main_sequences = None
-        self.bonus_sequences = None
-        self.data_prepared = False
-        
-    @ErrorHandler.handle_exception(logger, "data preparation")
-    def prepare_data(self, force_reload=False):
-        """Load, process, and prepare data for model training with improved caching."""
-        # Return cached data if already prepared and not forcing reload
-        if self.data_prepared and not force_reload and self.X_scaled is not None:
-            logger.info("Using cached prepared data")
-            
-            # Get latest data for creating target variables
-            expanded_data = self.processor.expanded_data
-            
-            # Create target variables (next draw's numbers)
-            # Subtract 1 from each number to use as index (0-49 for main, 0-11 for bonus)
-            y_main = np.array([
-                expanded_data.iloc[self.sequence_length:][f"main_{i+1}"].values - 1 for i in range(MAIN_NUM_COUNT)
-            ]).T
-            
-            y_bonus = np.array([
-                expanded_data.iloc[self.sequence_length:][f"bonus_{i+1}"].values - 1 for i in range(BONUS_NUM_COUNT)
-            ]).T
-            
-            # Match feature data to sequence data
-            X_scaled_matched = self.X_scaled.iloc[self.sequence_length:]
-            
-            return {
-                "X": X_scaled_matched.values,
-                "main_sequences": self.main_sequences,
-                "bonus_sequences": self.bonus_sequences,
-                "y_main": y_main,
-                "y_bonus": y_bonus,
-                "data": self.processor.data  # Original data for reference
-            }
-        
-        logger.info("Preparing data for lottery prediction")
-        
-        # Load and process lottery data
-        data = self.processor.parse_file()
-        if data.empty:
-            raise ValueError("Failed to parse lottery data")
-            
-        # Ensure processor is using the correct sequence length
-        self.processor.set_sequence_length(self.sequence_length)
-            
-        expanded_data = self.processor.expand_numbers()
-        features = self.processor.create_features()
-        
-        if features.empty:
-            raise ValueError("Feature engineering failed")
-        
-        # Scale features
-        X_raw = features.select_dtypes(include=[np.number])
-        X_raw = X_raw.fillna(0)
-        
-        # Scale features - with improved standardization and outlier handling
-        # Robust scaling for better handling of outliers
-        X_scaled_array = self.feature_scaler.fit_transform(X_raw)
-        
-        # Check for extreme values after scaling and clip them
-        X_scaled_array = np.clip(X_scaled_array, -10, 10)  # Clip to reasonable range
-        
-        # Convert back to DataFrame
-        self.X_scaled = pd.DataFrame(
-            X_scaled_array,
-            columns=X_raw.columns,
-            index=X_raw.index
-        )
-        
-        # Create sequence features for transformer
-        self._create_sequences(expanded_data)
-        
-        # Create target variables (next draw's numbers)
-        # Subtract 1 from each number to use as index (0-49 for main, 0-11 for bonus)
-        y_main = np.array([
-            expanded_data.iloc[self.sequence_length:][f"main_{i+1}"].values - 1 for i in range(MAIN_NUM_COUNT)
-        ]).T
-        
-        y_bonus = np.array([
-            expanded_data.iloc[self.sequence_length:][f"bonus_{i+1}"].values - 1 for i in range(BONUS_NUM_COUNT)
-        ]).T
-        
-        # Match feature data to sequence data
-        X_scaled_matched = self.X_scaled.iloc[self.sequence_length:]
-        
-        # Mark as prepared
-        self.data_prepared = True
-        
-        logger.info(f"Data preparation complete. Features: {X_scaled_matched.shape}")
-        
-        return {
-            "X": X_scaled_matched.values,
-            "main_sequences": self.main_sequences,
-            "bonus_sequences": self.bonus_sequences,
-            "y_main": y_main,
-            "y_bonus": y_bonus,
-            "data": data  # Original data for reference
-        }
-    
-    @ErrorHandler.handle_exception(logger, "sequence creation")
-    def _create_sequences(self, expanded_data):
-        """Create sequence data for transformer model using optimized vectorized operations."""
-        logger.info(f"Creating sequence data for transformer model (length: {self.sequence_length})")
-        
-        # Process in sliding windows
-        num_samples = len(expanded_data) - self.sequence_length
-        
-        # Pre-allocate arrays for efficiency
-        main_sequences = np.zeros((num_samples, self.sequence_length, MAIN_NUM_MAX))
-        bonus_sequences = np.zeros((num_samples, self.sequence_length, BONUS_NUM_MAX))
-        
-        # Extract ranges more efficiently using list comprehensions
-        main_cols = [f"main_{i+1}" for i in range(MAIN_NUM_COUNT)]
-        bonus_cols = [f"bonus_{i+1}" for i in range(BONUS_NUM_COUNT)]
-        
-        # Check for NaN values in columns
-        if expanded_data[main_cols + bonus_cols].isna().any().any():
-            logger.warning("NaN values detected in number columns. Filling with -1 for processing.")
-            expanded_data[main_cols + bonus_cols] = expanded_data[main_cols + bonus_cols].fillna(-1)
-        
-        # Process each window more efficiently
-        for i in range(num_samples):
-            # Get the window of previous draws
-            window = expanded_data.iloc[i:i+self.sequence_length]
-            
-            # For each draw in the window, set the corresponding values in the sequences
-            for j, (_, row) in enumerate(window.iterrows()):
-                # Convert main numbers to one-hot encoding in one operation
-                main_nums = np.array([row[col] for col in main_cols if not pd.isna(row[col])]).astype(int)
-                main_nums = main_nums[main_nums > 0] - 1  # Convert to 0-based indices
-                if len(main_nums) > 0:
-                    main_sequences[i, j, main_nums] = 1
-                
-                # Same for bonus numbers
-                bonus_nums = np.array([row[col] for col in bonus_cols if not pd.isna(row[col])]).astype(int)
-                bonus_nums = bonus_nums[bonus_nums > 0] - 1  # Convert to 0-based indices
-                if len(bonus_nums) > 0:
-                    bonus_sequences[i, j, bonus_nums] = 1
-        
-        self.main_sequences = main_sequences
-        self.bonus_sequences = bonus_sequences
-        
-        logger.info(f"Created sequences: Main shape: {self.main_sequences.shape}, Bonus shape: {self.bonus_sequences.shape}")
-    
-    @ErrorHandler.handle_exception(logger, "model training")
-    def train_model(self, validation_split=0.1):
-        """Train the lottery prediction model with improved methodology."""
-        logger.info("Training lottery prediction model")
-        
-        # Prepare data
-        data_dict = self.prepare_data()
-        
-        # Create and build model
-        self.model = LotteryModel(self.params)
-        
-        # Build models with the correct sequence length
-        input_dim = data_dict["X"].shape[1]
-        self.model.build_models(input_dim, self.sequence_length)
-        
-        # Train models with dynamic batch size based on data size
-        # Smaller batch sizes for smaller datasets
-        n_samples = len(data_dict["X"])
-        if n_samples < 500:
-            batch_size = min(16, max(4, n_samples // 20))
-        elif n_samples < 1000:
-            batch_size = min(32, max(8, n_samples // 30))
-        else:
-            batch_size = self.params.get('batch_size', DEFAULT_BATCH_SIZE)
-            
-        # Ensure batch size is not larger than dataset with validation split
-        max_batch = int(n_samples * (1 - validation_split))
-        batch_size = min(batch_size, max_batch)
-        
-        history = self.model.train_models(
-            X_train=data_dict["X"],
-            main_seq_train=data_dict["main_sequences"],
-            bonus_seq_train=data_dict["bonus_sequences"],
-            y_main_train=data_dict["y_main"],
-            y_bonus_train=data_dict["y_bonus"],
-            validation_split=validation_split,
-            batch_size=batch_size
-        )
-        
-        logger.info("Model training complete")
-        Utilities.clean_memory(force=True)
-        return history
-    
-    @ErrorHandler.handle_exception(logger, "prediction", lambda self, num_draws, **kwargs: self.generate_fallback_predictions(num_draws))
-    def predict(self, num_draws=5, temperature=DEFAULT_TEMPERATURE, diversity_sampling=True):
-        """Generate lottery predictions with improved confidence calibration."""
-        logger.info(f"Generating {num_draws} lottery predictions")
-        
-        if self.model is None:
-            raise ValueError("Model not trained. Call train_model() first.")
-        
-        # Prepare the latest data for prediction
-        latest_features = self.X_scaled.iloc[-1:].values
-        latest_main_seq = self.main_sequences[-1:] 
-        latest_bonus_seq = self.bonus_sequences[-1:]
-        
-        # Generate predictions
-        predictions = self.model.predict(
-            features=latest_features,
-            main_sequence=latest_main_seq,
-            bonus_sequence=latest_bonus_seq,
-            num_draws=num_draws,
-            temperature=temperature,
-            diversity_sampling=diversity_sampling
-        )
-        
-        # Add pattern and frequency scores
-        data = self.processor.data
-        if data is not None and not data.empty:
-            for pred in predictions:
-                pattern_score = Utilities.calculate_pattern_score(
-                    pred["main_numbers"], pred["bonus_numbers"]
-                )
-                frequency_score = Utilities.calculate_frequency_score(
-                    pred["main_numbers"], pred["bonus_numbers"], data
-                )
-                
-                pred["confidence"]["pattern_score"] = float(pattern_score)
-                pred["confidence"]["frequency_score"] = float(frequency_score)
-                
-                # Update overall confidence with a balanced approach
-                pred["confidence"]["overall"] = float(
-                    (pred["confidence"]["overall"] + pattern_score + frequency_score) / 3
-                )
-        
-        return predictions
-    
-    def generate_fallback_predictions(self, num_draws=5):
-        """Generate fallback predictions using improved statistical approach."""
-        logger.warning("Using enhanced fallback prediction method")
-        
-        try:
-            data = self.processor.parse_file()
-            
-            # Calculate historical frequency with recency bias
-            main_counts = np.zeros(MAIN_NUM_MAX)
-            bonus_counts = np.zeros(BONUS_NUM_MAX)
-            
-            if data is not None and not data.empty:
-                n_draws = len(data)
-                
-                # Apply recency bias - more recent draws have higher weight
-                for i, (_, row) in enumerate(data.iterrows()):
-                    # Calculate weight based on position (more recent draws have higher weight)
-                    recency_weight = 0.5 + 0.5 * (i / n_draws)  # Weight ranges from 0.5 to 1.0
-                    
-                    for num in row["main_numbers"]:
-                        if MAIN_NUM_MIN <= num <= MAIN_NUM_MAX:
-                            main_counts[num-1] += recency_weight
-                            
-                    for num in row["bonus_numbers"]:
-                        if BONUS_NUM_MIN <= num <= BONUS_NUM_MAX:
-                            bonus_counts[num-1] += recency_weight
-                            
-                # Normalize to probabilities
-                main_sum = np.sum(main_counts)
-                bonus_sum = np.sum(bonus_counts)
-                
-                main_probs = main_counts / main_sum if main_sum > 0 else np.ones(MAIN_NUM_MAX) / MAIN_NUM_MAX
-                bonus_probs = bonus_counts / bonus_sum if bonus_sum > 0 else np.ones(BONUS_NUM_MAX) / BONUS_NUM_MAX
-                
-                # Small smoothing to avoid zero probabilities
-                main_probs = 0.95 * main_probs + 0.05 / MAIN_NUM_MAX
-                bonus_probs = 0.95 * bonus_probs + 0.05 / BONUS_NUM_MAX
-            else:
-                # If no data, use uniform distribution
-                main_probs = np.ones(MAIN_NUM_MAX) / MAIN_NUM_MAX
-                bonus_probs = np.ones(BONUS_NUM_MAX) / BONUS_NUM_MAX
-            
-            # Generate predictions using the same sampling logic as the model
-            predictions = []
-            used_main_numbers = set()
-            used_bonus_numbers = set()
-            
-            for draw_idx in range(num_draws):
-                # Convert frequencies to the same format expected by sample_numbers
-                main_position_probs = [[main_probs] for _ in range(MAIN_NUM_COUNT)]
-                bonus_position_probs = [[bonus_probs] for _ in range(BONUS_NUM_COUNT)]
-                
-                # Dynamic temperature based on draw index
-                draw_temp = DEFAULT_TEMPERATURE * (1.0 + 0.1 * draw_idx)  # Increase temperature for later draws
-                
-                # Use the unified sampling method
-                main_numbers = Utilities.sample_numbers(
-                    probs=main_position_probs,
-                    available_nums=range(MAIN_NUM_MIN, MAIN_NUM_MAX+1),
-                    num_to_select=MAIN_NUM_COUNT,
-                    used_nums=used_main_numbers,
-                    diversity_sampling=True,
-                    draw_idx=draw_idx,
-                    temperature=draw_temp
-                )
-                
-                bonus_numbers = Utilities.sample_numbers(
-                    probs=bonus_position_probs,
-                    available_nums=range(BONUS_NUM_MIN, BONUS_NUM_MAX+1),
-                    num_to_select=BONUS_NUM_COUNT,
-                    used_nums=used_bonus_numbers,
-                    diversity_sampling=True,
-                    draw_idx=draw_idx,
-                    temperature=draw_temp
-                )
-                
-                # Store position information for evaluation metrics
-                main_positions = {num: idx for idx, num in enumerate(main_numbers)}
-                
-                # Calculate pattern score for these numbers
-                pattern_score = Utilities.calculate_pattern_score(main_numbers, bonus_numbers)
-                frequency_score = 0.5  # Neutral frequency score
-                
-                if data is not None and not data.empty:
-                    frequency_score = Utilities.calculate_frequency_score(main_numbers, bonus_numbers, data)
-                
-                # Calculate confidence based on sampling method
-                base_confidence = 0.35  # Higher base for frequency-based sampling vs pure random
-                
-                predictions.append({
-                    "main_numbers": main_numbers,
-                    "main_number_positions": main_positions,
-                    "bonus_numbers": bonus_numbers,
-                    "confidence": {
-                        "overall": float((base_confidence + pattern_score + frequency_score) / 3),
-                        "main_numbers": float(base_confidence),
-                        "bonus_numbers": float(base_confidence),
-                        "pattern_score": float(pattern_score),
-                        "frequency_score": float(frequency_score)
-                    },
-                    "method": "frequency_based_fallback",
-                    "temperature": float(draw_temp)
-                })
-                
-                # Clean memory less frequently
-                if draw_idx > 0 and (draw_idx % CLEAN_MEMORY_FREQUENCY) == 0:
-                    Utilities.clean_memory()
-            
-            return predictions
-            
-        except Exception as e:
-            logger.error(f"Error in fallback prediction: {str(e)}")
-            # Fallback to truly random predictions
-            return self._generate_random_predictions(num_draws)
-    
-    def _generate_random_predictions(self, num_draws):
-        """Generate completely random predictions as a last resort with improved diversity."""
-        predictions = []
-        
-        used_main_numbers = set()
-        used_bonus_numbers = set()
-        
-        for draw_idx in range(num_draws):
-            try:
-                # Use more sophisticated sampling for diversity
-                if draw_idx == 0 or random.random() < 0.7:
-                    # Standard random sampling
-                    main_numbers = sorted(random.sample(range(MAIN_NUM_MIN, MAIN_NUM_MAX+1), MAIN_NUM_COUNT))
-                    bonus_numbers = sorted(random.sample(range(BONUS_NUM_MIN, BONUS_NUM_MAX+1), BONUS_NUM_COUNT))
-                else:
-                    # Diversity-aware sampling
-                    available_main = list(set(range(MAIN_NUM_MIN, MAIN_NUM_MAX+1)) - used_main_numbers)
-                    available_bonus = list(set(range(BONUS_NUM_MIN, BONUS_NUM_MAX+1)) - used_bonus_numbers)
-                    
-                    # Ensure enough numbers are available
-                    if len(available_main) < MAIN_NUM_COUNT:
-                        available_main = list(range(MAIN_NUM_MIN, MAIN_NUM_MAX+1))
-                    if len(available_bonus) < BONUS_NUM_COUNT:
-                        available_bonus = list(range(BONUS_NUM_MIN, BONUS_NUM_MAX+1))
-                    
-                    main_numbers = sorted(random.sample(available_main, MAIN_NUM_COUNT))
-                    bonus_numbers = sorted(random.sample(available_bonus, BONUS_NUM_COUNT))
-                
-                # Update used numbers sets
-                used_main_numbers.update(main_numbers)
-                used_bonus_numbers.update(bonus_numbers)
-                
-                # Store position information
-                main_positions = {num: idx for idx, num in enumerate(main_numbers)}
-                
-                # Calculate pattern score for random numbers
-                pattern_score = Utilities.calculate_pattern_score(main_numbers, bonus_numbers)
-                
-                predictions.append({
-                    "main_numbers": main_numbers,
-                    "main_number_positions": main_positions,
-                    "bonus_numbers": bonus_numbers,
-                    "confidence": {
-                        "overall": 0.15,
-                        "main_numbers": 0.15,
-                        "bonus_numbers": 0.15,
-                        "pattern_score": float(pattern_score),
-                        "frequency_score": 0.15
-                    },
-                    "method": "pure_random_fallback",
-                    "temperature": 1.0
-                })
-                
-            except Exception:
-                # Ultimate fallback if even random.sample fails
-                try:
-                    main_numbers = sorted([random.randint(MAIN_NUM_MIN, MAIN_NUM_MAX) for _ in range(MAIN_NUM_COUNT)])
-                    bonus_numbers = sorted([random.randint(BONUS_NUM_MIN, BONUS_NUM_MAX) for _ in range(BONUS_NUM_COUNT)])
-                    
-                    predictions.append({
-                        "main_numbers": main_numbers,
-                        "bonus_numbers": bonus_numbers,
-                        "confidence": {
-                            "overall": 0.1,
-                            "main_numbers": 0.1,
-                            "bonus_numbers": 0.1,
-                            "pattern_score": 0.1,
-                            "frequency_score": 0.1
-                        },
-                        "method": "emergency_random_fallback",
-                        "temperature": 1.5
-                    })
-                except Exception as e:
-                    logger.error(f"Emergency fallback failed: {e}")
-                    # Skip this prediction in the worst case
-                    continue
-        
-        return predictions
 
 #######################
 # VISUALIZATION FUNCTIONS
 #######################
 
 @ErrorHandler.handle_exception(logger, "visualization", None)
-def generate_visualizations(predictions, file_path, include_historical=True):
-    """Generate enhanced visualizations for lottery predictions with better analytics."""
+def generate_visualizations(predictions, file_path, output_dir=VISUALIZATION_DIR):
+    """Generate enhanced visualizations for lottery predictions."""
     logger.info("Generating visualizations for lottery predictions")
     
-    # Create processor to get historical data
-    processor = LotteryDataProcessor(file_path)
-    data = processor.parse_file()
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
     
-    if data.empty and include_historical:
-        logger.error("No data available for visualization")
-        include_historical = False
+    # Load historical data for comparison
+    include_historical = False
+    try:
+        processor = LotteryDataProcessor(file_path)
+        data = processor.parse_file()
+        include_historical = not data.empty
+    except Exception as e:
+        logger.warning(f"Could not load historical data for visualization: {e}")
+        data = None
     
     # Set up the figure for main visualization
     plt.figure(figsize=(16, 12))
     
-    # Plot 1: Frequency of main numbers (historical vs predicted)
+    # Plot 1: Frequency of main numbers
     plt.subplot(2, 2, 1)
     
     if include_historical:
-        # Historical frequency - vectorized calculation
+        # Historical frequency
         main_freq = np.zeros(MAIN_NUM_MAX)
         all_main_numbers = [num for row in data["main_numbers"] for num in row]
         for num in all_main_numbers:
@@ -3486,10 +4627,10 @@ def generate_visualizations(predictions, file_path, include_historical=True):
                 main_freq[num-1] += 1
         main_freq = main_freq / len(data) if len(data) > 0 else np.zeros(MAIN_NUM_MAX)
     else:
-        # Create a uniform distribution as baseline if no historical data
+        # Create a uniform distribution as baseline
         main_freq = np.ones(MAIN_NUM_MAX) / MAIN_NUM_MAX
     
-    # Predicted frequency - vectorized calculation
+    # Predicted frequency
     pred_main_freq = np.zeros(MAIN_NUM_MAX)
     all_pred_main_numbers = [num for pred in predictions for num in pred["main_numbers"]]
     for num in all_pred_main_numbers:
@@ -3497,7 +4638,7 @@ def generate_visualizations(predictions, file_path, include_historical=True):
             pred_main_freq[num-1] += 1
     pred_main_freq = pred_main_freq / len(predictions) if len(predictions) > 0 else np.zeros(MAIN_NUM_MAX)
     
-    # Create the plot
+    # Create the bar chart
     x = np.arange(1, MAIN_NUM_MAX+1)
     width = 0.35
     
@@ -3512,11 +4653,11 @@ def generate_visualizations(predictions, file_path, include_historical=True):
     plt.legend()
     plt.grid(axis='y', alpha=0.3)
     
-    # Plot 2: Frequency of bonus numbers (historical vs predicted)
+    # Plot 2: Frequency of bonus numbers
     plt.subplot(2, 2, 2)
     
     if include_historical:
-        # Historical frequency - vectorized calculation
+        # Historical frequency
         bonus_freq = np.zeros(BONUS_NUM_MAX)
         all_bonus_numbers = [num for row in data["bonus_numbers"] for num in row]
         for num in all_bonus_numbers:
@@ -3614,12 +4755,12 @@ def generate_visualizations(predictions, file_path, include_historical=True):
     plt.legend()
     plt.grid(axis='y', alpha=0.3)
     
-    # Save figure
+    # Save first figure
     plt.tight_layout()
-    plt.savefig("lottery_predictions.png", dpi=300)
+    plt.savefig(os.path.join(output_dir, "lottery_predictions.png"), dpi=300)
     plt.close()
     
-    # Create enhanced pattern analysis visualization
+    # Create second figure for additional analysis
     plt.figure(figsize=(16, 12))
     
     # Plot 1: Odd/Even Distribution
@@ -3762,136 +4903,108 @@ def generate_visualizations(predictions, file_path, include_historical=True):
     plt.legend()
     plt.grid(axis='y', alpha=0.3)
     
-    # Plot 4: Average Gap Analysis
+    # Plot 4: Method Analysis
     plt.subplot(2, 2, 4)
     
-    # Calculate average gap between numbers
-    if include_historical:
-        hist_gaps = []
-        for row in data["main_numbers"]:
-            sorted_nums = sorted(row)
-            gaps = [sorted_nums[i+1] - sorted_nums[i] for i in range(len(sorted_nums)-1)]
-            hist_gaps.append(np.mean(gaps) if gaps else 0)
-    else:
-        # Baseline - theoretical random distribution
-        hist_gaps = np.random.normal(10, 2, 100)  # Centered around 10 with some variation
-    
-    pred_gaps = []
+    # Count predictions by method
+    method_counts = {}
     for pred in predictions:
-        sorted_nums = sorted(pred["main_numbers"])
-        gaps = [sorted_nums[i+1] - sorted_nums[i] for i in range(len(sorted_nums)-1)]
-        pred_gaps.append(np.mean(gaps) if gaps else 0)
+        method = pred.get("method", "unknown")
+        if method in method_counts:
+            method_counts[method] += 1
+        else:
+            method_counts[method] = 1
     
-    # Create the plots - kernel density estimation for smoother visualization
-    hist_gaps = np.array(hist_gaps)
-    pred_gaps = np.array(pred_gaps)
+    # Create pie chart
+    methods = list(method_counts.keys())
+    counts = list(method_counts.values())
     
-    from scipy.stats import gaussian_kde
-    
-    # Only perform KDE if we have sufficient data points
-    if len(hist_gaps) > 5 and np.std(hist_gaps) > 0:
-        hist_kde = gaussian_kde(hist_gaps)
-        x_hist = np.linspace(min(hist_gaps), max(hist_gaps), 100)
-        plt.plot(x_hist, hist_kde(x_hist), label='Historical' if include_historical else 'Baseline', color='royalblue')
+    if methods:
+        plt.pie(counts, labels=methods, autopct='%1.1f%%', startangle=90, 
+               colors=plt.cm.tab10.colors[:len(methods)])
+        plt.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle
+        plt.title("Prediction Methods Distribution", fontsize=14)
     else:
-        # Fallback to histogram
-        plt.hist(hist_gaps, bins=10, alpha=0.5, label='Historical' if include_historical else 'Baseline', 
-                color='royalblue', density=True)
+        plt.text(0.5, 0.5, "No method data available",
+               horizontalalignment='center', verticalalignment='center')
     
-    if len(pred_gaps) > 5 and np.std(pred_gaps) > 0:
-        pred_kde = gaussian_kde(pred_gaps)
-        x_pred = np.linspace(min(pred_gaps), max(pred_gaps), 100)
-        plt.plot(x_pred, pred_kde(x_pred), label='Predicted', color='seagreen')
-    else:
-        # Fallback to histogram
-        plt.hist(pred_gaps, bins=10, alpha=0.5, label='Predicted', color='seagreen', density=True)
+    # Save the second figure
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "pattern_analysis.png"), dpi=300)
+    plt.close()
     
-    plt.title("Average Gap Between Numbers", fontsize=14)
-    plt.xlabel("Average Gap", fontsize=12)
-    plt.ylabel("Density", fontsize=12)
-    plt.legend()
+    # Create a third figure for confidence analysis
+    plt.figure(figsize=(16, 8))
+    
+    # Plot 1: Confidence vs Pattern Score
+    plt.subplot(1, 2, 1)
+    
+    # Extract confidence and pattern scores
+    overall_confidences = [pred["confidence"]["overall"] for pred in predictions]
+    pattern_scores = [pred["confidence"].get("pattern_score", 0) for pred in predictions]
+    
+    plt.scatter(pattern_scores, overall_confidences, alpha=0.7)
+    plt.title("Confidence vs. Pattern Score", fontsize=14)
+    plt.xlabel("Pattern Score", fontsize=12)
+    plt.ylabel("Overall Confidence", fontsize=12)
     plt.grid(alpha=0.3)
     
-    # Save the pattern analysis
-    plt.tight_layout()
-    plt.savefig("pattern_analysis.png", dpi=300)
-    plt.close()
+    # Add trend line
+    if len(overall_confidences) > 1:
+        z = np.polyfit(pattern_scores, overall_confidences, 1)
+        p = np.poly1d(z)
+        plt.plot(sorted(pattern_scores), p(sorted(pattern_scores)), "r--", alpha=0.7)
     
-    # Create correlation/heatmap visualization
-    plt.figure(figsize=(14, 10))
-    
-    # Create heatmap of number co-occurrences in predictions
-    co_occurrence = np.zeros((MAIN_NUM_MAX, MAIN_NUM_MAX))
-    
-    for pred in predictions:
-        for i in pred["main_numbers"]:
-            for j in pred["main_numbers"]:
-                if 1 <= i <= MAIN_NUM_MAX and 1 <= j <= MAIN_NUM_MAX:
-                    co_occurrence[i-1, j-1] += 1
-    
-    # Normalize by diagonal values
-    for i in range(MAIN_NUM_MAX):
-        if co_occurrence[i, i] > 0:
-            co_occurrence[:, i] = co_occurrence[:, i] / co_occurrence[i, i]
-    
-    # Plot reduced size heatmap to make it more viewable
-    # Focus on numbers 1-25
-    plt.subplot(1, 2, 1)
-    plt.imshow(co_occurrence[:25, :25], cmap='viridis', origin='lower')
-    plt.colorbar(label='Normalized Co-occurrence')
-    plt.title("Number Co-occurrence Heatmap (1-25)", fontsize=14)
-    plt.xlabel("Number", fontsize=12)
-    plt.ylabel("Number", fontsize=12)
-    plt.xticks(range(0, 25, 5), range(1, 26, 5))
-    plt.yticks(range(0, 25, 5), range(1, 26, 5))
-    
-    # Focus on numbers 26-50
+    # Plot 2: Number occurrence heatmap
     plt.subplot(1, 2, 2)
-    plt.imshow(co_occurrence[25:, 25:], cmap='viridis', origin='lower')
-    plt.colorbar(label='Normalized Co-occurrence')
-    plt.title("Number Co-occurrence Heatmap (26-50)", fontsize=14)
-    plt.xlabel("Number", fontsize=12)
-    plt.ylabel("Number", fontsize=12)
-    plt.xticks(range(0, 25, 5), range(26, 51, 5))
-    plt.yticks(range(0, 25, 5), range(26, 51, 5))
     
-    # Save the heatmap
+    # Create matrix of frequency counts for numbers appearing together
+    cooccurrence = np.zeros((10, 5))  # 5 decades x 5 positions
+    
+    # Count occurrences of each number by decade and position
+    for pred in predictions:
+        main_nums = pred["main_numbers"]
+        for i, num in enumerate(sorted(main_nums)):
+            # Determine decade (0-4)
+            decade = (num - 1) // 10
+            if 0 <= decade < 5:
+                cooccurrence[decade*2, i] += 1
+                # Also bump adjacent cells for smoother visualization
+                if decade*2 + 1 < 10:
+                    cooccurrence[decade*2 + 1, i] += 0.5
+    
+    # Normalize
+    row_sums = cooccurrence.sum(axis=1, keepdims=True)
+    if np.all(row_sums > 0):
+        cooccurrence = cooccurrence / row_sums
+    
+    # Create heatmap
+    plt.imshow(cooccurrence, cmap='viridis', aspect='auto')
+    plt.colorbar(label='Normalized Frequency')
+    plt.title("Number Decade vs. Position Heatmap", fontsize=14)
+    plt.xlabel("Position (Left to Right)", fontsize=12)
+    plt.ylabel("Number Decade", fontsize=12)
+    
+    # Set y-ticks for decades
+    decades = ['1-10', '11-20', '21-30', '31-40', '41-50']
+    plt.yticks(np.arange(0, 10, 2), decades)
+    
+    # Set x-ticks for positions
+    plt.xticks(np.arange(5), [f"Pos {i+1}" for i in range(5)])
+    
+    # Save the third figure
     plt.tight_layout()
-    plt.savefig("number_correlation.png", dpi=300)
+    plt.savefig(os.path.join(output_dir, "confidence_analysis.png"), dpi=300)
     plt.close()
     
-    logger.info("Enhanced visualizations saved to lottery_predictions.png, pattern_analysis.png, and number_correlation.png")
-    return ["lottery_predictions.png", "pattern_analysis.png", "number_correlation.png"]
-
-
-def configure_tensorflow():
-    """Configure TensorFlow to reduce warnings and optimize performance."""
-    # Reduce threading warnings
-    try:
-        tf.config.threading.set_inter_op_parallelism_threads(1)
-        tf.config.threading.set_intra_op_parallelism_threads(1)
-    except:
-        pass
+    logger.info(f"Visualizations saved to {output_dir}")
     
-    # Set logging level to suppress warnings
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-    
-    # Disable eager execution for better performance with graph mode
-    try:
-        tf.compat.v1.disable_eager_execution()
-    except:
-        pass
-    
-    # Set GPU memory growth
-    try:
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-    except:
-        pass
-    
-    logger.info("TensorFlow configured for optimal performance")
+    # Return paths to visualization files
+    return [
+        os.path.join(output_dir, "lottery_predictions.png"),
+        os.path.join(output_dir, "pattern_analysis.png"),
+        os.path.join(output_dir, "confidence_analysis.png")
+    ]
 
 
 #######################
@@ -3899,41 +5012,54 @@ def configure_tensorflow():
 #######################
 
 def main():
-    """Main function to run the improved lottery prediction system."""
+    """Main function to run the hybrid neural lottery prediction system."""
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Optimized Transformer-Based EuroMillions Prediction System")
+    parser = argparse.ArgumentParser(description="Hybrid Neural Lottery Prediction System")
     parser.add_argument("--file", default="lottery_numbers.txt", help="Path to lottery data file")
     parser.add_argument("--optimize", action="store_true", help="Run hyperparameter optimization before prediction")
     parser.add_argument("--trials", type=int, default=30, help="Number of optimization trials")
     parser.add_argument("--predictions", type=int, default=20, help="Number of predictions to generate")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate model performance with cross-validation")
     parser.add_argument("--ensemble", action="store_true", help="Use ensemble for improved predictions")
-    parser.add_argument("--num_models", type=int, default=5, help="Number of models in ensemble")
-    parser.add_argument("--params", default="transformer_params.json", help="Path to parameters file")
-    parser.add_argument("--sequence_length", type=int, default=20, help="Sequence length for historical data")
+    parser.add_argument("--params", default="hybrid_params.json", help="Path to parameters file")
+    parser.add_argument("--sequence_length", type=int, default=None, help="Override sequence length for historical data")
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help="Temperature for sampling")
     parser.add_argument("--output", default="predictions.json", help="Output file for predictions")
+    parser.add_argument("--no_visualize", action="store_true", help="Skip visualization generation")
+    parser.add_argument("--load_existing", action="store_true", help="Load existing models instead of training")
+    parser.add_argument("--force_train", action="store_true", help="Force training even with load_existing")
+    parser.add_argument("--gpus", type=int, default=None, help="Number of GPUs to use (default: use all available)")
+    parser.add_argument("--match_recent", action="store_true", help="Evaluate predictions against recent results")
+    parser.add_argument("--recent_draws", type=int, default=5, help="Number of recent draws to use for evaluation")
 
     args = parser.parse_args()
     
     try:
-        configure_tensorflow()
+        # Configure GPU usage
+        if args.gpus is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(args.gpus))
+            print(f"Limited to {args.gpus} GPU(s)")
+        
+        # Apply memory optimizations
+        optimize_memory_usage()
+
         # Print header
         print("\n" + "="*80)
-        print("ENHANCED TRANSFORMER-BASED EUROMILLIONS LOTTERY PREDICTION SYSTEM".center(80))
+        print("HYBRID NEURAL LOTTERY PREDICTION SYSTEM".center(80))
         print("="*80 + "\n")
-        print("This system uses transformer models with advanced feature engineering")
-        print("and ensemble techniques to enhance prediction accuracy.")
+        print("This system combines transformer models, frequency analysis, and pattern recognition")
+        print("to enhance lottery prediction accuracy.")
         print("\nDISCLAIMER: Lottery outcomes are primarily random events and no")
         print("prediction system can guarantee winning numbers.")
         print("="*80 + "\n")
+
         
         # Check if data file exists
         if not os.path.exists(args.file):
             print(f"Error: Lottery data file '{args.file}' not found.")
             sys.exit(1)
         
-        # Load parameters with unified error handling
+        # Load parameters
         params = Utilities.load_params(args.params, Utilities.get_default_params())
         
         # Override sequence length if provided
@@ -3943,7 +5069,7 @@ def main():
         
         # Handle optimization if requested
         if args.optimize:
-            print(f"Running hyperparameter optimization with {args.trials} trials...")
+            print(f"\nRunning hyperparameter optimization with {args.trials} trials...")
             optimizer = HyperparameterOptimizer(args.file, args.trials)
             params = optimizer.optimize()
             Utilities.save_params(params, args.params)
@@ -3953,43 +5079,51 @@ def main():
             plot_file = optimizer.plot_optimization_history()
             if plot_file:
                 print(f"Optimization history plot saved to {plot_file}")
-        
-        # Evaluate model if requested
-        if args.evaluate:
-            print("\nEvaluating model performance with cross-validation...")
-            evaluator = CrossValidationEvaluator(args.file, params)
-            performance = evaluator.evaluate()
-            
-            if 'error' in performance:
-                print(f"\nError during evaluation: {performance['error']}")
-            
-            print("\nCross-Validation Performance:")
-            print(f"Overall Accuracy: {performance['avg_overall_accuracy']*100:.2f}%")
-            print(f"Main Numbers Accuracy: {performance['avg_main_accuracy']*100:.2f}%")
-            print(f"Bonus Numbers Accuracy: {performance['avg_bonus_accuracy']*100:.2f}%")
-            print(f"Partial Match Score: {performance['avg_partial_match_score']*100:.2f}%")
             
             # Clean memory
             Utilities.clean_memory(force=True)
         
-        # Generate predictions
-        predictions = None
-        if args.ensemble:
-            print(f"\nTraining ensemble with {args.num_models} diverse models...")
-            ensemble = EnsemblePredictor(args.file, args.num_models, params)
-            ensemble.train()
-            
-            print(f"\nGenerating {args.predictions} ensemble predictions...")
-            predictions = ensemble.predict(args.predictions, temperature=args.temperature)
-        else:
-            print("\nTraining transformer model...")
-            system = LotteryPredictionSystem(args.file, params)
-            system.train_model()
-            
-            print(f"\nGenerating {args.predictions} predictions...")
-            predictions = system.predict(args.predictions, temperature=args.temperature)
+        # Create the prediction system
+        print("\nInitializing hybrid neural prediction system...")
+        system = HybridNeuralSystem(args.file, params=params)
+        system.load_existing = args.load_existing
         
-        # Check if we got valid predictions
+        # Prepare data
+        print("Preparing data...")
+        system.prepare_data()
+        
+        # Evaluate model if requested
+        if args.evaluate:
+            print("\nEvaluating model performance with cross-validation...")
+            evaluator = CrossValidationEvaluator(system, folds=5)
+            performance = evaluator.evaluate()
+            
+            print("\nCross-Validation Performance:")
+            print(f"Overall Accuracy: {performance['avg_overall_acc']*100:.2f}%")
+            print(f"Pattern Score: {performance['avg_pattern_score']*100:.2f}%")
+            print(f"Combined Score: {performance['avg_score']*100:.2f}%")
+            
+            # Clean memory
+            Utilities.clean_memory(force=True)
+        
+        # Build models
+        print("\nBuilding prediction models...")
+        system.build_models()
+        
+        # Train models if not loading existing or if force_train is specified
+        if not args.load_existing or args.force_train:
+            print("\nTraining prediction models (this may take some time)...")
+            system.train_models()
+            print("Model training completed successfully.")
+        else:
+            print("\nUsing existing trained models...")
+            # Could add a check here to verify models exist
+        
+        # Generate predictions
+        print(f"\nGenerating {args.predictions} predictions...")
+        predictions = system.predict(args.predictions, temperature=args.temperature)
+        
+        # Check if we have valid predictions
         if not predictions or len(predictions) == 0:
             print("\nError: Failed to generate predictions.")
             sys.exit(1)
@@ -4031,15 +5165,75 @@ def main():
             print(f"Confidence: {confidence:.2f}%")
             if "method" in pred:
                 print(f"Method: {pred['method']}")
-            if "temperature" in pred:
-                print(f"Temperature: {pred['temperature']:.2f}")
             print("-" * 30)
+                
+        # Evaluate predictions against recent draws if requested
+        if args.match_recent and system.processor.data is not None:
+            print(f"\nEvaluating predictions against {args.recent_draws} most recent draws...")
+            
+            # Get the most recent draws
+            recent_draws = system.processor.data.tail(args.recent_draws)
+            
+            # Calculate match scores for each prediction against each recent draw
+            match_results = []
+            
+            for i, pred in enumerate(predictions):
+                best_score = 0
+                best_draw_info = None
+                
+                for _, row in recent_draws.iterrows():
+                    # Format actual draw
+                    actual_draw = {
+                        "main_numbers": row["main_numbers"],
+                        "main_number_positions": {num: idx for idx, num in enumerate(row["main_numbers"])},
+                        "bonus_numbers": row["bonus_numbers"]
+                    }
+                    
+                    # Calculate match score using our utility function
+                    match_score = Utilities.calculate_partial_match_score(pred, actual_draw)
+                    
+                    # Track best match
+                    if match_score > best_score:
+                        best_score = match_score
+                        draw_date = row["date"].strftime("%Y-%m-%d") if hasattr(row["date"], "strftime") else str(row["date"])
+                        main_matches = len(set(pred["main_numbers"]) & set(row["main_numbers"]))
+                        bonus_matches = len(set(pred["bonus_numbers"]) & set(row["bonus_numbers"]))
+                        
+                        best_draw_info = {
+                            "date": draw_date,
+                            "score": match_score,
+                            "main_matches": main_matches,
+                            "bonus_matches": bonus_matches
+                        }
+                
+                match_results.append({
+                    "prediction": i+1,
+                    "main_numbers": pred["main_numbers"],
+                    "best_match": best_draw_info,
+                    "score": best_score
+                })
+            
+            # Sort results by match score
+            match_results.sort(key=lambda x: x["score"], reverse=True)
+            
+            # Display top matching predictions
+            print("\nPredictions Ranked by Match Score:")
+            print("=" * 50)
+            
+            for i, result in enumerate(match_results[:min(5, len(match_results))]):
+                print(f"Rank {i+1} (Score: {result['score']:.4f}):")
+                print(f"  Prediction: Main Numbers {result['main_numbers']}")
+                if result["best_match"]:
+                    print(f"  Best Match: {result['best_match']['date']}")
+                    print(f"  Main Matches: {result['best_match']['main_matches']}, Bonus Matches: {result['best_match']['bonus_matches']}")
+                print("-" * 40)
         
         # Generate visualizations
-        print("\nGenerating enhanced visualizations...")
-        viz_files = generate_visualizations(predictions, args.file)
-        if viz_files:
-            print(f"Visualizations saved to: {', '.join(viz_files)}")
+        if not args.no_visualize:
+            print("\nGenerating enhanced visualizations...")
+            viz_files = generate_visualizations(predictions, args.file)
+            if viz_files:
+                print(f"Visualizations saved: {', '.join(viz_files)}")
         
         # Print summary with optimized calculation
         try:
@@ -4079,15 +5273,15 @@ def main():
             print("are not guaranteed to win. Please gamble responsibly.")
             
         except Exception as e:
-            logger.error(f"Error in summary generation: {str(e)}")
+            logging.error(f"Error in summary generation: {str(e)}")
             print(f"\nError generating summary: {str(e)}")
     
     except KeyboardInterrupt:
         print("\nPrediction system stopped by user.")
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
+        logging.error(f"Unexpected error: {str(e)}")
         print(f"\nError: {str(e)}")
-        print("Check enhanced_transformer.log for details.")
+        print("Check hybrid_neural_lottery.log for details.")
 
 if __name__ == "__main__":
     main()
