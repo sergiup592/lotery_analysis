@@ -2013,6 +2013,9 @@ class ModelBuilder:
     @ErrorHandler.handle_exception(logger, "model building")
     def build_transformer_model(input_dim, seq_length, params, model_config, distribution_strategy=None):
         """Build transformer model for lottery number prediction with flexible configuration."""
+        # Import optimizers explicitly here to ensure they're in scope
+        from tensorflow.keras.optimizers import Adam, SGD, RMSprop
+        
         # Use provided strategy or get default
         if distribution_strategy is None:
             distribution_strategy = tf.distribute.get_strategy()  # Default strategy
@@ -2284,7 +2287,6 @@ class ModelBuilder:
                 optimizer = RMSprop(learning_rate=learning_rate)
             elif optimizer_name == 'adamw':
                 # Add support for AdamW optimizer
-                from tensorflow.keras.optimizers import Adam
                 # Some versions of TF don't have AdamW directly
                 try:
                     from tensorflow.keras.optimizers import AdamW
@@ -3047,6 +3049,12 @@ class EnsembleCalibrator:
             iteration: Current prediction iteration (for diversity)
             diversity_factor: How much to penalize previously selected numbers
         """
+        # Check if model_probs is empty to prevent StopIteration
+        if not model_probs:
+            logger.warning("Empty model probabilities received in calibrate_ensemble")
+            # Return a default probability distribution
+            return np.ones((1, 50)) / 50  # Adjust 50 to match your output dimension
+            
         # Calculate dynamic temperature based on confidence and iteration
         base_temp = self.temperature_range[0] + 0.2 * iteration  # Increase temperature for later iterations
         
@@ -3082,6 +3090,12 @@ class EnsembleCalibrator:
                 
             # Apply temperature scaling
             scaled_probs[model_name] = self._apply_temperature(probs_array, model_temp)
+        
+        # Check if scaled_probs is empty before accessing (fix for StopIteration)
+        if not scaled_probs:
+            logger.warning("No valid model probabilities for ensemble calibration.")
+            # Return a default probability distribution
+            return np.ones((1, 50)) / 50  # Adjust 50 to match your output dimension
         
         # Combine using learned weights that evolve with iterations
         # First draw - trust transformer model more
@@ -4073,8 +4087,11 @@ class HyperparameterOptimizer:
     @ErrorHandler.handle_exception(logger, "optimization trial")
     def objective(self, trial):
         """Objective function for hyperparameter optimization."""
-        # Define expanded parameter ranges
+        # Define expanded parameter ranges with model_type first
         params = {
+            # Define model_type early to avoid conflicts with dynamic parameters
+            'model_type': trial.suggest_categorical('model_type', ['transformer', 'lstm', 'rnn', 'hybrid']),
+            
             # Learning rate with finer granularity
             'learning_rate': trial.suggest_float('learning_rate', 0.0001, 0.003, log=True),
             
@@ -4111,9 +4128,6 @@ class HyperparameterOptimizer:
             # More regularization options
             'l2_regularization': trial.suggest_float('l2_regularization', 1e-6, 1e-3, log=True),
             
-            # Include additional model types
-            'model_type': trial.suggest_categorical('model_type', ['transformer', 'lstm', 'rnn', 'hybrid']),
-            
             # Architecture options
             'use_residual': trial.suggest_categorical('use_residual', [True, False]),
             'use_layer_scaling': trial.suggest_categorical('use_layer_scaling', [True, False]),
@@ -4127,12 +4141,15 @@ class HyperparameterOptimizer:
             'use_transformer_model': trial.suggest_categorical('use_transformer_model', [True, True, False]),  # 2/3 chance of using transformer
         }
         
-        # Add model-specific parameters based on model type
-        if params['model_type'] == 'lstm':
-            params['lstm_units'] = trial.suggest_categorical('lstm_units', [24, 32, 48, 64, 96, 128])
-        elif params['model_type'] == 'hybrid':
-            params['lstm_units'] = trial.suggest_categorical('lstm_units', [24, 32, 48, 64])
-            params['gru_units'] = trial.suggest_categorical('gru_units', [24, 32, 48, 64])
+        # Add model-specific parameters based on model type - conditionally
+        model_type = params['model_type']
+        if model_type == 'lstm' or model_type == 'hybrid':
+            # Only suggest lstm_units for lstm or hybrid models
+            if model_type == 'lstm':
+                params['lstm_units'] = trial.suggest_categorical('lstm_units_lstm', [24, 32, 48, 64, 96, 128])
+            else:  # hybrid model
+                params['lstm_units'] = trial.suggest_categorical('lstm_units_hybrid', [24, 32, 48, 64])
+                params['gru_units'] = trial.suggest_categorical('gru_units', [24, 32, 48, 64])
         
         try:
             # Initialize hybrid system with these parameters
@@ -4346,8 +4363,8 @@ class CrossValidationEvaluator:
         self.folds = folds
     
     @ErrorHandler.handle_exception(logger, "cross-validation", {
-        'fold_metrics': [], 'avg_overall_acc': 0.0, 
-        'avg_pattern_score': 0.0, 'avg_score': 0.0
+    'fold_metrics': [], 'avg_overall_acc': 0.0, 
+    'avg_pattern_score': 0.0, 'avg_score': 0.0
     })
     def evaluate(self):
         """Perform time-series cross-validation with enhanced scoring."""
@@ -4419,8 +4436,18 @@ class CrossValidationEvaluator:
                 frequency_model = None
                 pattern_model = None
                 
-                # Only train enabled models
-                if params.get('use_transformer_model', True):
+                # Only train enabled models - INITIALIZE MODEL FLAGS
+                transformer_enabled = params.get('use_transformer_model', True)
+                frequency_enabled = params.get('use_frequency_model', True)
+                pattern_enabled = params.get('use_pattern_model', True)
+                
+                # Ensure at least one model is enabled
+                if not (transformer_enabled or frequency_enabled or pattern_enabled):
+                    logger.warning("No models enabled for ensemble, enabling frequency model as fallback")
+                    frequency_enabled = True
+                    params['use_frequency_model'] = True
+                
+                if transformer_enabled:
                     transformer_model = TransformerModel(input_shape, MAIN_NUM_MAX, params)
                     transformer_model.build_model()
                     
@@ -4432,12 +4459,12 @@ class CrossValidationEvaluator:
                         validation_split=0.1
                     )
                 
-                if params.get('use_frequency_model', True):
+                if frequency_enabled:
                     frequency_model = FrequencyModel()
                     frequency_model.build_model()
                     frequency_model.train(X_train, y_main_raw_train)
                 
-                if params.get('use_pattern_model', True):
+                if pattern_enabled:
                     pattern_model = PatternModel()
                     pattern_model.build_model()
                     pattern_model.train(X_train, y_main_raw_train)
@@ -4449,20 +4476,25 @@ class CrossValidationEvaluator:
                     # Get predictions from each model
                     model_probs = {}
                     
-                    # Get transformer model predictions
+                    # Get transformer model predictions only if model is enabled and trained
                     if transformer_model is not None:
                         transformer_probs = transformer_model.predict((X_test[i:i+1], main_seq_test[i:i+1]))
                         model_probs['transformer'] = transformer_probs
                     
-                    # Get frequency model predictions
+                    # Get frequency model predictions only if model is enabled and trained
                     if frequency_model is not None:
                         freq_probs = frequency_model.predict_probabilities(X_test[i:i+1])
                         model_probs['frequency'] = freq_probs
                     
-                    # Get pattern model predictions
+                    # Get pattern model predictions only if model is enabled and trained
                     if pattern_model is not None:
                         pattern_probs = pattern_model.predict_probabilities(X_test[i:i+1])
                         model_probs['pattern'] = pattern_probs
+                    
+                    # Check if we have any model predictions before proceeding
+                    if not model_probs:
+                        logger.warning(f"No valid model predictions for sample {i} in fold {fold+1}")
+                        continue
                     
                     # Combine model predictions based on ensemble weights
                     ensemble_weights = params.get('ensemble_weights', {
@@ -4471,15 +4503,10 @@ class CrossValidationEvaluator:
                         'pattern': 0.3
                     })
                     
-                    # Adjust weights if models aren't available
-                    if transformer_model is None:
-                        ensemble_weights['transformer'] = 0
-                    if frequency_model is None:
-                        ensemble_weights['frequency'] = 0
-                    if pattern_model is None:
-                        ensemble_weights['pattern'] = 0
-                        
-                    # Normalize weights
+                    # Only use weights for models that are available
+                    ensemble_weights = {k: v for k, v in ensemble_weights.items() if k in model_probs}
+                    
+                    # Normalize weights if any models are missing
                     weight_sum = sum(ensemble_weights.values())
                     if weight_sum > 0:
                         ensemble_weights = {k: v / weight_sum for k, v in ensemble_weights.items()}
@@ -4523,7 +4550,7 @@ class CrossValidationEvaluator:
                         "main_number_positions": main_positions,
                         "bonus_numbers": bonus_numbers
                     }
-              
+            
                     # Create actual draw dict
                     actual_draw = {
                         "main_numbers": actual_numbers,
@@ -4531,7 +4558,7 @@ class CrossValidationEvaluator:
                         "bonus_numbers": actual_bonus
                     }
                     
-                    # Calculate partial match score - NEW CODE USING THE FUNCTION
+                    # Calculate partial match score
                     match_score = Utilities.calculate_partial_match_score(prediction, actual_draw)
                     
                     # Calculate pattern score
@@ -4540,7 +4567,7 @@ class CrossValidationEvaluator:
                     predictions.append({
                         'predicted': main_numbers,
                         'actual': actual_numbers,
-                        'partial_match_score': match_score,  # Store the new score
+                        'partial_match_score': match_score,
                         'pattern_score': pattern_score
                     })
                 
@@ -4553,7 +4580,7 @@ class CrossValidationEvaluator:
                     # Store metrics
                     fold_metrics.append({
                         'fold': fold + 1,
-                        'match_score': avg_match_score,  # Updated variable name
+                        'match_score': avg_match_score,
                         'pattern_score': avg_pattern_score,
                         'score': 0.7 * avg_match_score + 0.3 * avg_pattern_score
                     })
@@ -4585,7 +4612,7 @@ class CrossValidationEvaluator:
         
         return {
             'fold_metrics': fold_metrics,
-            'avg_overall_acc': avg_match_score,  # Updated variable name (was match_rate)
+            'avg_overall_acc': avg_match_score,
             'avg_pattern_score': avg_pattern_score,
             'avg_score': avg_score
         }
