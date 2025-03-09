@@ -4141,12 +4141,15 @@ class HyperparameterOptimizer:
             'use_transformer_model': trial.suggest_categorical('use_transformer_model', [True, True, False]),  # 2/3 chance of using transformer
         }
         
-        # Add model-specific parameters
-        if model_type == 'lstm':
-            params['lstm_units'] = lstm_units
-        elif model_type == 'hybrid':
-            params['lstm_units_hybrid'] = lstm_units
-            params['gru_units'] = gru_units
+        # Add model-specific parameters based on model type - conditionally
+        model_type = params['model_type']
+        if model_type == 'lstm' or model_type == 'hybrid':
+            # Only suggest lstm_units for lstm or hybrid models
+            if model_type == 'lstm':
+                params['lstm_units'] = trial.suggest_categorical('lstm_units_lstm', [24, 32, 48, 64, 96, 128])
+            else:  # hybrid model
+                params['lstm_units'] = trial.suggest_categorical('lstm_units_hybrid', [24, 32, 48, 64])
+                params['gru_units'] = trial.suggest_categorical('gru_units', [24, 32, 48, 64])
         
         try:
             # Initialize hybrid system with these parameters
