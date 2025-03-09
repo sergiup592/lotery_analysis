@@ -1,0 +1,26 @@
+{
+    "model_type": "hybrid",
+    "learning_rate": 0.0002571938310857584,
+    "batch_size": 32,
+    "dropout_rate": 0.45000000000000007,
+    "num_heads": 4,
+    "ff_dim": 320,
+    "embed_dim": 112,
+    "use_gru": true,
+    "conv_filters": 16,
+    "num_transformer_blocks": 4,
+    "optimizer": "adamw",
+    "sequence_length": 32,
+    "l2_regularization": 3.504967279628363e-05,
+    "use_residual": true,
+    "use_layer_scaling": true,
+    "min_delta": 0.00041470159664428667,
+    "use_frequency_model": false,
+    "use_pattern_model": true,
+    "use_transformer_model": false,
+    "lstm_units_hybrid": 24,
+    "gru_units": 32,
+    "ensemble_weights": {
+        "pattern": 1.0
+    }
+}
