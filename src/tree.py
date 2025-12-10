@@ -52,18 +52,50 @@ class RandomForestModel:
         self.is_trained = True
         logger.info("Random Forest training complete.")
 
-    def _apply_sampling_bias(self, probs: np.ndarray, top_k: int, temperature: float) -> np.ndarray:
-        """Reweight probabilities by temperature and optionally limit to top-k."""
+    def _apply_sampling_bias(self, probs: np.ndarray, top_k: int, temperature: float,
+                               top_p: float = None, required_nonzero: int = None) -> np.ndarray:
+        """
+        Reweight probabilities using proper temperature scaling and nucleus sampling.
+        Temperature is applied to logits for proper Boltzmann distribution.
+        """
         probs = np.array(probs, dtype=np.float64)
-        if top_k and top_k < probs.size:
-            top_indices = np.argpartition(probs, -top_k)[-top_k:]
+        probs = np.clip(probs, 1e-10, 1.0 - 1e-10)
+
+        # Convert to logits for proper temperature scaling
+        logits = np.log(probs / (1 - probs))
+
+        if temperature and temperature > 0:
+            logits = logits / temperature
+
+        # Convert back via softmax
+        exp_logits = np.exp(logits - np.max(logits))
+        probs = exp_logits / np.sum(exp_logits)
+
+        effective_top_k = top_k if top_k else probs.size
+        if required_nonzero is not None:
+            effective_top_k = max(effective_top_k, required_nonzero)
+
+        # Nucleus (top-p) sampling
+        if top_p is not None and 0 < top_p < 1:
+            sorted_indices = np.argsort(probs)[::-1]
+            cumsum = np.cumsum(probs[sorted_indices])
+            cutoff_idx = np.searchsorted(cumsum, top_p) + 1
+            cutoff_idx = max(cutoff_idx, required_nonzero or 1)
+            nucleus_indices = sorted_indices[:cutoff_idx]
+            mask = np.zeros_like(probs)
+            mask[nucleus_indices] = 1.0
+            probs = probs * mask
+        elif effective_top_k and effective_top_k < probs.size:
+            top_indices = np.argpartition(probs, -effective_top_k)[-effective_top_k:]
             mask = np.zeros_like(probs)
             mask[top_indices] = 1.0
             probs = probs * mask
-        if temperature and temperature > 0:
-            probs = np.power(probs, 1.0 / temperature)
+
         total = probs.sum()
         if total <= 0:
+            probs = np.ones_like(probs)
+            total = probs.sum()
+        if required_nonzero is not None and np.count_nonzero(probs) < required_nonzero:
             probs = np.ones_like(probs)
             total = probs.sum()
         return probs / total
@@ -91,11 +123,15 @@ class RandomForestModel:
             main_probs,
             top_k=self.sampling.get("top_k_main"),
             temperature=self.sampling.get("temperature_main"),
+            top_p=self.sampling.get("top_p_main"),
+            required_nonzero=N_MAIN
         )
         bonus_probs = self._apply_sampling_bias(
             bonus_probs,
             top_k=self.sampling.get("top_k_bonus"),
             temperature=self.sampling.get("temperature_bonus"),
+            top_p=self.sampling.get("top_p_bonus"),
+            required_nonzero=N_BONUS
         )
         main_prob_vector = main_probs.copy()
         bonus_prob_vector = bonus_probs.copy()
@@ -136,7 +172,7 @@ class RandomForestModel:
         return predictions
 
     def _prepare_data(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Prepare features (X) and targets (y) for training."""
+        """Prepare features (X) and targets (y) for training with enhanced features."""
         dm = LotteryDataManager()
         main_gaps, bonus_gaps = dm.calculate_gap_states(data, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE)
         main_gap_delta, bonus_gap_delta = dm.calculate_gap_delta_features(data)
@@ -145,18 +181,23 @@ class RandomForestModel:
         main_hot_cold, bonus_hot_cold = dm.calculate_hot_cold_features(data)
         main_affinity, bonus_affinity = dm.calculate_cooccurrence_features(data)
         global_features = dm.calculate_global_features(data)
-        
+
+        # New advanced features
+        main_var_ent, bonus_var_ent = dm.calculate_variance_entropy_features(data)
+        main_momentum, bonus_momentum = dm.calculate_momentum_features(data)
+        spread_features = dm.calculate_spread_features(data)
+
         X = []
         y_main = []
         y_bonus = []
-        
+
         # Start from index 100 to ensure we have history for frequency windows
         start_idx = 100
         if len(data) <= start_idx:
             start_idx = 1
-            
+
         for i in range(start_idx, len(data)):
-            # Features
+            # Features - Order must match build_feature_vector_for_next_draw
             row_features = [main_gaps[i], bonus_gaps[i]]
             for w in sorted(main_gap_delta.keys()):
                 row_features.append(main_gap_delta[w][i])
@@ -164,33 +205,40 @@ class RandomForestModel:
                 row_features.append(bonus_gap_delta[w][i])
             for v in freq_features.values():
                 row_features.append(v[i])
-                
+
             row_features.append(date_features[i])
             row_features.append(main_hot_cold[i])
             row_features.append(bonus_hot_cold[i])
-            
+
             # Add Affinity Features
             row_features.append(main_affinity[i])
             row_features.append(bonus_affinity[i])
-            
+
             # Add Global Features
             row_features.append(global_features[i])
-                
+
+            # Add New Advanced Features
+            row_features.append(main_var_ent[i])
+            row_features.append(bonus_var_ent[i])
+            row_features.append(main_momentum[i])
+            row_features.append(bonus_momentum[i])
+            row_features.append(spread_features[i])
+
             X.append(np.hstack(row_features))
-            
+
             # Targets
             row = data.iloc[i]
-            
+
             main_target = np.zeros(MAIN_NUMBER_RANGE)
             for num in row['main_numbers']:
                 if 1 <= num <= MAIN_NUMBER_RANGE:
                     main_target[num-1] = 1
             y_main.append(main_target)
-            
+
             bonus_target = np.zeros(BONUS_NUMBER_RANGE)
             for num in row['bonus_numbers']:
                 if 1 <= num <= BONUS_NUMBER_RANGE:
                     bonus_target[num-1] = 1
             y_bonus.append(bonus_target)
-            
+
         return np.array(X), np.array(y_main), np.array(y_bonus)

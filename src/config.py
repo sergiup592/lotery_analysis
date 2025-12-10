@@ -43,18 +43,21 @@ STATISTICAL_CONFIG = {
 
 PPO_PARAMS = {
     "learning_rate": 0.00005,
-    "clip_ratio": 0.2,
+    "clip_ratio": 0.15,
     "gamma": 0.99,
     "lam": 0.95,
-    "entropy_coef": 0.01,
+    "entropy_coef": 0.05,    # Increased from 0.02 for better exploration
     "batch_size": 64
 }
 
 # Sampling configuration (used for all model samplers)
 SAMPLING_CONFIG = {
-    # Sharper sampling to focus on the highest-probability numbers while retaining some exploration
-    "temperature_main": 0.50,
-    "temperature_bonus": 0.50,
-    "top_k_main": 5,   # limit draws to top-K highest probabilities
-    "top_k_bonus": 3
+    # Balanced sampling: focus on high-probability numbers while maintaining diversity
+    # Higher temperature = more exploration, lower = more exploitation
+    "temperature_main": 0.65,      # Increased for better diversity (was 0.40)
+    "temperature_bonus": 0.60,     # Increased for better diversity (was 0.40)
+    "top_k_main": 12,              # Expanded candidate pool (was 4) - now 24% of range
+    "top_k_bonus": 6,              # Expanded candidate pool (was 3) - now 50% of range
+    "top_p_main": 0.85,            # Nucleus sampling: cumulative probability threshold
+    "top_p_bonus": 0.80            # Alternative to top-k for adaptive cutoff
 }

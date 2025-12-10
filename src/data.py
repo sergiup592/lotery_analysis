@@ -151,73 +151,64 @@ class LotteryDataManager:
 
     def calculate_cooccurrence_features(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Calculate Co-occurrence (Affinity) features.
-        For each draw t, calculates a vector for t+1 where index i is the 
-        sum of co-occurrence counts between number i+1 and all numbers in draw t.
-        
+        Calculate Co-occurrence (Affinity) features WITHOUT data leakage.
+        For each draw t, calculates a vector based ONLY on historical data (draws 0 to t-1).
+
+        This prevents the model from "seeing" future co-occurrence patterns during training.
+
         Returns:
             main_affinity: (n_draws, MAIN_NUMBER_RANGE)
             bonus_affinity: (n_draws, BONUS_NUMBER_RANGE)
         """
         from .config import MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE
-        
+
         n_draws = len(data)
-        
-        # 1. Build Global Co-occurrence Matrix (Main)
-        # Count how often num i and num j appear together
-        main_cooc = np.zeros((MAIN_NUMBER_RANGE, MAIN_NUMBER_RANGE))
-        
-        for _, row in data.iterrows():
-            nums = [n for n in row['main_numbers'] if 1 <= n <= MAIN_NUMBER_RANGE]
-            for n1 in nums:
-                for n2 in nums:
-                    if n1 != n2:
-                        main_cooc[n1-1, n2-1] += 1
-                        
-        # Normalize rows to get probabilities P(n2 | n1)
-        # Add 1 to avoid division by zero
-        main_cooc_norm = main_cooc / (np.sum(main_cooc, axis=1, keepdims=True) + 1e-9)
-        
-        # 2. Build Global Co-occurrence Matrix (Bonus)
-        bonus_cooc = np.zeros((BONUS_NUMBER_RANGE, BONUS_NUMBER_RANGE))
-        for _, row in data.iterrows():
-            nums = [n for n in row['bonus_numbers'] if 1 <= n <= BONUS_NUMBER_RANGE]
-            for n1 in nums:
-                for n2 in nums:
-                    if n1 != n2:
-                        bonus_cooc[n1-1, n2-1] += 1
-                        
-        bonus_cooc_norm = bonus_cooc / (np.sum(bonus_cooc, axis=1, keepdims=True) + 1e-9)
-        
-        # 3. Calculate Affinity Features for each draw
         main_affinity = np.zeros((n_draws, MAIN_NUMBER_RANGE))
         bonus_affinity = np.zeros((n_draws, BONUS_NUMBER_RANGE))
-        
-        # For the first draw, we have no history, so 0 affinity
-        # For draw i, we look at numbers in draw i-1
-        for i in range(1, n_draws):
-            prev_row = data.iloc[i-1]
-            
-            # Main Affinity
-            prev_main = [n for n in prev_row['main_numbers'] if 1 <= n <= MAIN_NUMBER_RANGE]
-            if prev_main:
-                # Sum of probabilities: For each candidate 'c', sum P(c | p) for all p in prev_main
-                # This tells us: "How likely is 'c' given the numbers we just saw?"
-                for c in range(MAIN_NUMBER_RANGE):
-                    score = 0
-                    for p in prev_main:
-                        score += main_cooc_norm[p-1, c]
-                    main_affinity[i, c] = score
-                    
-            # Bonus Affinity
-            prev_bonus = [n for n in prev_row['bonus_numbers'] if 1 <= n <= BONUS_NUMBER_RANGE]
-            if prev_bonus:
-                for c in range(BONUS_NUMBER_RANGE):
-                    score = 0
-                    for p in prev_bonus:
-                        score += bonus_cooc_norm[p-1, c]
-                    bonus_affinity[i, c] = score
-                    
+
+        # Build co-occurrence incrementally to avoid data leakage
+        main_cooc = np.zeros((MAIN_NUMBER_RANGE, MAIN_NUMBER_RANGE))
+        bonus_cooc = np.zeros((BONUS_NUMBER_RANGE, BONUS_NUMBER_RANGE))
+
+        for i in range(n_draws):
+            if i > 0:
+                # Calculate affinity BEFORE updating with current draw
+                # Normalize current co-occurrence matrix
+                main_row_sums = np.sum(main_cooc, axis=1, keepdims=True) + 1e-9
+                main_cooc_norm = main_cooc / main_row_sums
+
+                bonus_row_sums = np.sum(bonus_cooc, axis=1, keepdims=True) + 1e-9
+                bonus_cooc_norm = bonus_cooc / bonus_row_sums
+
+                # Use previous draw's numbers to calculate affinity
+                prev_row = data.iloc[i-1]
+
+                prev_main = [n for n in prev_row['main_numbers'] if 1 <= n <= MAIN_NUMBER_RANGE]
+                if prev_main:
+                    for c in range(MAIN_NUMBER_RANGE):
+                        score = sum(main_cooc_norm[p-1, c] for p in prev_main)
+                        main_affinity[i, c] = score
+
+                prev_bonus = [n for n in prev_row['bonus_numbers'] if 1 <= n <= BONUS_NUMBER_RANGE]
+                if prev_bonus:
+                    for c in range(BONUS_NUMBER_RANGE):
+                        score = sum(bonus_cooc_norm[p-1, c] for p in prev_bonus)
+                        bonus_affinity[i, c] = score
+
+            # NOW update co-occurrence with current draw (for future rows)
+            row = data.iloc[i]
+            main_nums = [n for n in row['main_numbers'] if 1 <= n <= MAIN_NUMBER_RANGE]
+            for n1 in main_nums:
+                for n2 in main_nums:
+                    if n1 != n2:
+                        main_cooc[n1-1, n2-1] += 1
+
+            bonus_nums = [n for n in row['bonus_numbers'] if 1 <= n <= BONUS_NUMBER_RANGE]
+            for n1 in bonus_nums:
+                for n2 in bonus_nums:
+                    if n1 != n2:
+                        bonus_cooc[n1-1, n2-1] += 1
+
         return main_affinity, bonus_affinity
 
     def calculate_date_features(self, data: pd.DataFrame) -> np.ndarray:
@@ -338,7 +329,7 @@ class LotteryDataManager:
         
         return rolling_features
 
-    def calculate_gap_delta_features(self, data: pd.DataFrame, windows: List[int] = [10, 50]) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]:
+    def calculate_gap_delta_features(self, data: pd.DataFrame, windows: List[int] = [10, 30, 50]) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]:
         """
         Calculate deviations of current gap state from rolling averages over specified windows.
         Returns dictionaries mapping window -> delta array of shape (n_draws, main_range / bonus_range).
@@ -359,10 +350,135 @@ class LotteryDataManager:
 
         return main_deltas, bonus_deltas
 
+    def calculate_variance_entropy_features(self, data: pd.DataFrame, window: int = 20) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Calculate variance and entropy of number distributions in recent draws.
+        Higher entropy/variance = more random/diverse patterns.
+        Lower = more concentrated/predictable patterns.
+
+        Returns:
+            main_features: (n_draws, 2) [variance, entropy]
+            bonus_features: (n_draws, 2) [variance, entropy]
+        """
+        from .config import MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE
+        from scipy.stats import entropy
+
+        n_draws = len(data)
+        main_features = np.zeros((n_draws, 2))
+        bonus_features = np.zeros((n_draws, 2))
+
+        for i in range(window, n_draws):
+            # Get recent window
+            recent_data = data.iloc[max(0, i-window):i]
+
+            # Main numbers analysis
+            main_counts = np.zeros(MAIN_NUMBER_RANGE)
+            for _, row in recent_data.iterrows():
+                for num in row['main_numbers']:
+                    if 1 <= num <= MAIN_NUMBER_RANGE:
+                        main_counts[num-1] += 1
+
+            # Normalize to probability distribution
+            main_probs = main_counts / (main_counts.sum() + 1e-9)
+            main_features[i, 0] = np.var(main_counts)  # Variance
+            main_features[i, 1] = entropy(main_probs + 1e-9)  # Shannon entropy
+
+            # Bonus numbers analysis
+            bonus_counts = np.zeros(BONUS_NUMBER_RANGE)
+            for _, row in recent_data.iterrows():
+                for num in row['bonus_numbers']:
+                    if 1 <= num <= BONUS_NUMBER_RANGE:
+                        bonus_counts[num-1] += 1
+
+            bonus_probs = bonus_counts / (bonus_counts.sum() + 1e-9)
+            bonus_features[i, 0] = np.var(bonus_counts)
+            bonus_features[i, 1] = entropy(bonus_probs + 1e-9)
+
+        return main_features, bonus_features
+
+    def calculate_momentum_features(self, data: pd.DataFrame, windows: List[int] = [10, 30]) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Calculate rate of change (momentum) in number frequencies.
+        Positive momentum = increasing frequency, Negative = decreasing frequency.
+
+        Returns:
+            main_momentum: (n_draws, MAIN_NUMBER_RANGE)
+            bonus_momentum: (n_draws, BONUS_NUMBER_RANGE)
+        """
+        from .config import MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE
+
+        n_draws = len(data)
+        main_momentum = np.zeros((n_draws, MAIN_NUMBER_RANGE))
+        bonus_momentum = np.zeros((n_draws, BONUS_NUMBER_RANGE))
+
+        # Calculate frequency at two time points and find the difference (momentum)
+        short_window = windows[0]
+        long_window = windows[1]
+
+        for i in range(long_window, n_draws):
+            # Short-term frequency (recent)
+            recent_main = np.zeros(MAIN_NUMBER_RANGE)
+            recent_bonus = np.zeros(BONUS_NUMBER_RANGE)
+            for j in range(i - short_window, i):
+                for num in data.iloc[j]['main_numbers']:
+                    if 1 <= num <= MAIN_NUMBER_RANGE:
+                        recent_main[num-1] += 1
+                for num in data.iloc[j]['bonus_numbers']:
+                    if 1 <= num <= BONUS_NUMBER_RANGE:
+                        recent_bonus[num-1] += 1
+
+            # Long-term frequency (historical)
+            historical_main = np.zeros(MAIN_NUMBER_RANGE)
+            historical_bonus = np.zeros(BONUS_NUMBER_RANGE)
+            for j in range(i - long_window, i - short_window):
+                for num in data.iloc[j]['main_numbers']:
+                    if 1 <= num <= MAIN_NUMBER_RANGE:
+                        historical_main[num-1] += 1
+                for num in data.iloc[j]['bonus_numbers']:
+                    if 1 <= num <= BONUS_NUMBER_RANGE:
+                        historical_bonus[num-1] += 1
+
+            # Normalize and calculate momentum (difference)
+            recent_main_norm = recent_main / (short_window + 1e-9)
+            historical_main_norm = historical_main / ((long_window - short_window) + 1e-9)
+            main_momentum[i] = recent_main_norm - historical_main_norm
+
+            recent_bonus_norm = recent_bonus / (short_window + 1e-9)
+            historical_bonus_norm = historical_bonus / ((long_window - short_window) + 1e-9)
+            bonus_momentum[i] = recent_bonus_norm - historical_bonus_norm
+
+        return main_momentum, bonus_momentum
+
+    def calculate_spread_features(self, data: pd.DataFrame, window: int = 10) -> np.ndarray:
+        """
+        Calculate distribution spread metrics for drawn numbers.
+        Features: range, std dev, coefficient of variation.
+
+        Returns:
+            spread_features: (n_draws, 3) [range, std_dev, cv]
+        """
+        n_draws = len(data)
+        spread_features = np.zeros((n_draws, 3))
+
+        for i in range(n_draws):
+            nums = data.iloc[i]['main_numbers']
+            if len(nums) > 0:
+                spread_features[i, 0] = max(nums) - min(nums)  # Range
+                spread_features[i, 1] = np.std(nums)  # Standard deviation
+                mean_val = np.mean(nums)
+                spread_features[i, 2] = spread_features[i, 1] / (mean_val + 1e-9)  # CV
+
+        # Calculate rolling averages
+        spread_df = pd.DataFrame(spread_features)
+        rolling_spread = spread_df.rolling(window=window, min_periods=1).mean().shift(1).fillna(0).values
+
+        return rolling_spread
+
     def build_feature_vector_for_next_draw(self, data: pd.DataFrame) -> np.ndarray:
         """
         Assemble the feature vector used by tree/XGBoost models for the next draw.
         Centralizes the feature construction to ensure consistent ordering and to avoid duplication.
+        Includes advanced features: variance/entropy, momentum, and spread metrics.
         """
         from .config import MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE
 
@@ -371,34 +487,28 @@ class LotteryDataManager:
         main_hot_cold, bonus_hot_cold = self.calculate_hot_cold_features(data)
         main_gap_delta, bonus_gap_delta = self.calculate_gap_delta_features(data)
 
+        # New advanced features
+        main_var_ent, bonus_var_ent = self.calculate_variance_entropy_features(data)
+        main_momentum, bonus_momentum = self.calculate_momentum_features(data)
+        spread_features = self.calculate_spread_features(data)
+
         last_main_gap = main_gaps[-1]
         last_bonus_gap = bonus_gaps[-1]
-
         last_freqs = [v[-1] for v in freq_features.values()]
         last_main_hc = main_hot_cold[-1]
         last_bonus_hc = bonus_hot_cold[-1]
 
-        # Affinity for a hypothetical next draw: append a dummy row to extend affinity arrays by one.
+        # New feature values
+        last_main_var_ent = main_var_ent[-1]
+        last_bonus_var_ent = bonus_var_ent[-1]
+        last_main_momentum = main_momentum[-1]
+        last_bonus_momentum = bonus_momentum[-1]
+        last_spread = spread_features[-1]
+
+        # Project next draw date (assuming weekly draws)
         last_date_val = data.iloc[-1]['date']
-        # We need to increment date for the dummy row to get correct date features for next draw?
-        # For now, we just use the last known date features or we could project.
-        # Actually, for date features of the *next* draw, we should use the date of the next draw.
-        # But we don't know it. Assuming weekly?
-        # Let's just use the last draw's date features as a proxy or 0 if unknown.
-        # Better: The model predicts based on *previous* sequence.
-        # If we are predicting for a future draw, we might know the date.
-        # But for simplicity, let's assume the "next" draw is roughly same time or just use last available.
-        # Actually, `calculate_date_features` uses the date of the row.
-        # If we want features for the *prediction* target, we usually don't have them unless we input them.
-        # But here we are building features *from history* to predict next.
-        # Wait, `build_feature_vector_for_next_draw` is used for XGBoost input.
-        # XGBoost predicts `y` (numbers) given `X` (features from previous draws).
-        # So `X` should contain info *available* before the draw.
-        # Date of the draw *is* available (we know when we are playing).
-        # So we should ideally project the date.
-        # Let's add 7 days to the last date.
-        next_date = last_date_val + pd.Timedelta(days=7) # Assumption: Weekly
-        
+        next_date = last_date_val + pd.Timedelta(days=7)
+
         dummy_row = pd.DataFrame([{
             'date': next_date,
             'main_numbers': [],
@@ -407,11 +517,11 @@ class LotteryDataManager:
             'result': ''
         }])
         data_augmented = pd.concat([data, dummy_row], ignore_index=True)
-        
+
         # Recalculate date features for the augmented data to get the next date's features
         date_features_aug = self.calculate_date_features(data_augmented)
         target_date_feat = date_features_aug[-1]
-        
+
         main_aff_aug, bonus_aff_aug = self.calculate_cooccurrence_features(data_augmented)
         global_feats_aug = self.calculate_global_features(data_augmented)
 
@@ -423,9 +533,14 @@ class LotteryDataManager:
             last_main_gap, last_bonus_gap,
             *[main_gap_delta[w][-1] for w in sorted(main_gap_delta.keys())],
             *[bonus_gap_delta[w][-1] for w in sorted(bonus_gap_delta.keys())],
-            *last_freqs, 
+            *last_freqs,
             target_date_feat,
             last_main_hc, last_bonus_hc,
             last_main_affinity, last_bonus_affinity,
-            last_global
+            last_global,
+            last_main_var_ent,       # Variance/Entropy features
+            last_bonus_var_ent,
+            last_main_momentum,      # Momentum features
+            last_bonus_momentum,
+            last_spread              # Spread features
         ])

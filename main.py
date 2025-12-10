@@ -89,15 +89,19 @@ def main():
         xgb_preds = xgb_model.predict(data, num_predictions=n_candidates)
         
         all_preds = neural_preds + stat_preds + rf_preds + xgb_preds
-        
-        # 5. Consensus Ranking
+
+        # 5. Generate Ensemble Predictions (combines probability distributions)
+        logger.info("Generating ensemble predictions...")
+        ensemble_preds = consensus.ensemble_predictions(all_preds, num_outputs=args.predictions)
+
+        # 6. Consensus Ranking
         logger.info("Ranking candidates...")
-        ranked_preds = consensus.rank_predictions(all_preds)
-        
+        ranked_preds = consensus.rank_predictions(all_preds + ensemble_preds)
+
         # Select top N with diversity-aware chooser
         final_predictions = consensus.choose_diverse_top(ranked_preds, args.predictions)
-        
-        # 6. Output Results
+
+        # 7. Output Results
         output_file = PREDICTIONS_DIR / "hybrid_predictions.json"
         with open(output_file, 'w') as f:
             json.dump(final_predictions, f, indent=4)
@@ -125,4 +129,4 @@ if __name__ == "__main__":
     main()
 
 # python3 main.py --force-train --rl-train --predictions 5
-# python3 main.py --backtest --backtest-window 50 --backtest-topk 3 --backtest-use-neural
+# python3 main.py --backtest --backtest-window 50 --backtest-topk 2 --backtest-use-neural

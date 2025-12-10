@@ -40,10 +40,36 @@ class NeuralModel:
         main_model_path = MODELS_DIR / "main_transformer.keras"
         bonus_model_path = MODELS_DIR / "bonus_transformer.keras"
 
-        # Calculate input dimensions (includes 9 global summary features)
+        # Calculate input dimensions with enhanced features
+        # Components: gaps + gap_deltas(3 windows) + freqs(3) + date(19) + hot/cold(2*range) + affinity(range) + global(9) + var/ent(2) + momentum(range) + spread(3)
         global_feature_dim = 9
-        self.main_input_dim = MAIN_NUMBER_RANGE + (3 * MAIN_NUMBER_RANGE) + 19 + (2 * MAIN_NUMBER_RANGE) + MAIN_NUMBER_RANGE + global_feature_dim
-        self.bonus_input_dim = BONUS_NUMBER_RANGE + (3 * BONUS_NUMBER_RANGE) + 19 + (2 * BONUS_NUMBER_RANGE) + BONUS_NUMBER_RANGE + global_feature_dim
+        var_ent_dim = 2
+        spread_dim = 3
+        gap_delta_windows = 3  # windows [10, 30, 50]
+        self.main_input_dim = (
+            MAIN_NUMBER_RANGE +                          # gaps
+            (gap_delta_windows * MAIN_NUMBER_RANGE) +    # gap deltas
+            (3 * MAIN_NUMBER_RANGE) +                    # freqs
+            19 +                                         # date
+            (2 * MAIN_NUMBER_RANGE) +                    # hot/cold
+            MAIN_NUMBER_RANGE +                          # affinity
+            global_feature_dim +                         # global
+            var_ent_dim +                                # var/entropy
+            MAIN_NUMBER_RANGE +                          # momentum
+            spread_dim                                   # spread
+        )
+        self.bonus_input_dim = (
+            BONUS_NUMBER_RANGE +
+            (gap_delta_windows * BONUS_NUMBER_RANGE) +
+            (3 * BONUS_NUMBER_RANGE) +
+            19 +
+            (2 * BONUS_NUMBER_RANGE) +
+            BONUS_NUMBER_RANGE +
+            global_feature_dim +
+            var_ent_dim +
+            BONUS_NUMBER_RANGE +
+            spread_dim
+        )
 
         if main_model_path.exists() and bonus_model_path.exists():
             try:
@@ -196,67 +222,83 @@ class NeuralModel:
         self.models_loaded = True
 
     def _prepare_sequences(self, data: pd.DataFrame) -> Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray, np.ndarray]:
-        """Create sequences of Features for training."""
+        """Create sequences of Features for training with enhanced features."""
         from .data import LotteryDataManager
-        dm = LotteryDataManager() 
-        
+        dm = LotteryDataManager()
+
         # 1. Calculate all features
         main_gaps, bonus_gaps = dm.calculate_gap_states(data, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE)
+        main_gap_delta, bonus_gap_delta = dm.calculate_gap_delta_features(data)
         freq_features = dm.calculate_frequency_features(data)
         date_features = dm.calculate_date_features(data)
         main_hot_cold, bonus_hot_cold = dm.calculate_hot_cold_features(data)
         main_affinity, bonus_affinity = dm.calculate_cooccurrence_features(data)
         global_features = dm.calculate_global_features(data)
-        
-        # 2. Stack Features
-        # Main
+
+        # New advanced features
+        main_var_ent, bonus_var_ent = dm.calculate_variance_entropy_features(data)
+        main_momentum, bonus_momentum = dm.calculate_momentum_features(data)
+        spread_features = dm.calculate_spread_features(data)
+
+        # 2. Stack Features (MUST match order in build_models input_dim calculation)
+        # Main: gaps, gap_deltas, freqs, date, hot_cold, affinity, global, var_ent, momentum, spread
         main_feats_list = [main_gaps]
+        for w in sorted(main_gap_delta.keys()):
+            main_feats_list.append(main_gap_delta[w])
         for w in [10, 50, 100]:
             main_feats_list.append(freq_features[f'main_freq_{w}'])
         main_feats_list.append(date_features)
         main_feats_list.append(main_hot_cold)
         main_feats_list.append(main_affinity)
-        main_feats_list.append(global_features) # Add Global
+        main_feats_list.append(global_features)
+        main_feats_list.append(main_var_ent)
+        main_feats_list.append(main_momentum)
+        main_feats_list.append(spread_features)
         main_features = np.hstack(main_feats_list)
-        
-        # Bonus
+
+        # Bonus: gaps, gap_deltas, freqs, date, hot_cold, affinity, global, var_ent, momentum, spread
         bonus_feats_list = [bonus_gaps]
+        for w in sorted(bonus_gap_delta.keys()):
+            bonus_feats_list.append(bonus_gap_delta[w])
         for w in [10, 50, 100]:
             bonus_feats_list.append(freq_features[f'bonus_freq_{w}'])
         bonus_feats_list.append(date_features)
         bonus_feats_list.append(bonus_hot_cold)
         bonus_feats_list.append(bonus_affinity)
-        bonus_feats_list.append(global_features) # Add Global
+        bonus_feats_list.append(global_features)
+        bonus_feats_list.append(bonus_var_ent)
+        bonus_feats_list.append(bonus_momentum)
+        bonus_feats_list.append(spread_features)
         bonus_features = np.hstack(bonus_feats_list)
-        
+
         sequences_main = []
         sequences_bonus = []
         main_targets = []
         bonus_targets = []
-        
+
         seq_len = self.params['sequence_length']
-        
+
         for i in range(seq_len, len(data)):
             seq_main = main_features[i-seq_len+1 : i+1]
             seq_bonus = bonus_features[i-seq_len+1 : i+1]
-            
+
             target_draw = data.iloc[i]
-            
+
             main_target = np.zeros(MAIN_NUMBER_RANGE)
             for num in target_draw['main_numbers']:
                 if 1 <= num <= MAIN_NUMBER_RANGE:
                     main_target[num-1] = 1
-                    
+
             bonus_target = np.zeros(BONUS_NUMBER_RANGE)
             for num in target_draw['bonus_numbers']:
                 if 1 <= num <= BONUS_NUMBER_RANGE:
                     bonus_target[num-1] = 1
-            
+
             sequences_main.append(seq_main)
             sequences_bonus.append(seq_bonus)
             main_targets.append(main_target)
             bonus_targets.append(bonus_target)
-            
+
         return (np.array(sequences_main), np.array(sequences_bonus)), np.array(main_targets), np.array(bonus_targets)
 
     def train_ppo(self, data: pd.DataFrame, epochs: int = 50):
@@ -322,21 +364,71 @@ class NeuralModel:
                 main_actions = tf.random.categorical(tf.math.log(old_main_probs_norm + 1e-9), num_samples=N_MAIN)
                 bonus_actions = tf.random.categorical(tf.math.log(old_bonus_probs_norm + 1e-9), num_samples=N_BONUS)
                 
-                # Calculate Rewards
+                # Calculate Enhanced Rewards with near-miss detection
                 rewards = []
                 for i in range(batch_size):
                     # Main Reward
-                    selected_main = main_actions[i].numpy() + 1
-                    true_main = np.where(main_targets[batch_idx[i]] == 1)[0] + 1
-                    hits = len(set(selected_main) & set(true_main))
-                    
+                    selected_main = set(main_actions[i].numpy() + 1)
+                    true_main = set(np.where(main_targets[batch_idx[i]] == 1)[0] + 1)
+                    hits = len(selected_main & true_main)
+
                     # Bonus Reward
-                    selected_bonus = bonus_actions[i].numpy() + 1
-                    true_bonus = np.where(bonus_targets[batch_idx[i]] == 1)[0] + 1
-                    bonus_hits = len(set(selected_bonus) & set(true_bonus))
-                    
-                    r = (hits * 1.0) + (bonus_hits * 2.0)
-                    if hits >= 3: r += 10.0
+                    selected_bonus = set(bonus_actions[i].numpy() + 1)
+                    true_bonus = set(np.where(bonus_targets[batch_idx[i]] == 1)[0] + 1)
+                    bonus_hits = len(selected_bonus & true_bonus)
+
+                    # Base reward (exponential scaling for hits)
+                    r = 0.0
+                    if hits > 0:
+                        r += (2.0 ** hits) - 1.0  # Exponential: 1, 3, 7, 15, 31 for 1-5 hits
+                    if bonus_hits > 0:
+                        r += (1.5 ** bonus_hits) * 2.0  # Bonus hits worth more
+
+                    # Near-miss reward: reward numbers that were off by 1 or 2
+                    # This helps the model learn to concentrate probability mass near correct numbers
+                    near_miss_main = 0
+                    for sel in selected_main:
+                        for true in true_main:
+                            diff = abs(sel - true)
+                            if diff == 1:
+                                near_miss_main += 0.3  # Adjacent number
+                            elif diff == 2:
+                                near_miss_main += 0.1  # Two away
+                    r += near_miss_main
+
+                    near_miss_bonus = 0
+                    for sel in selected_bonus:
+                        for true in true_bonus:
+                            diff = abs(sel - true)
+                            if diff == 1:
+                                near_miss_bonus += 0.4
+                            elif diff == 2:
+                                near_miss_bonus += 0.15
+                    r += near_miss_bonus
+
+                    # Probability calibration bonus - reward confident correct predictions
+                    selected_main_indices = np.array(list(selected_main)) - 1
+                    selected_bonus_indices = np.array(list(selected_bonus)) - 1
+                    selected_main_probs = old_main_probs_norm[i].numpy()[selected_main_indices]
+                    selected_bonus_probs = old_bonus_probs_norm[i].numpy()[selected_bonus_indices]
+                    prob_confidence = float(np.mean(selected_main_probs)) + float(np.mean(selected_bonus_probs))
+
+                    # If prediction was correct AND confident, big bonus
+                    if hits >= 2:
+                        r += prob_confidence * 5.0
+                    elif hits >= 1:
+                        r += prob_confidence * 2.0
+
+                    # Penalty for overconfident wrong predictions
+                    if hits == 0 and prob_confidence > 0.6:
+                        r -= 2.0
+
+                    # Baseline subtraction: subtract expected random performance
+                    # Random chance of hitting k main numbers follows hypergeometric distribution
+                    # Expected hits for random = N_MAIN * (N_MAIN / MAIN_NUMBER_RANGE) = 5 * (5/50) = 0.5
+                    baseline_reward = 0.5
+                    r -= baseline_reward
+
                     rewards.append(r)
                 
                 rewards = tf.convert_to_tensor(rewards, dtype=tf.float32)
@@ -420,59 +512,116 @@ class NeuralModel:
         self.bonus_model.save(MODELS_DIR / "bonus_transformer.keras")
         logger.info("PPO Fine-Tuning Complete.")
 
-    def _apply_sampling_bias(self, probs: np.ndarray, top_k: int, temperature: float) -> np.ndarray:
+    def _apply_sampling_bias(self, probs: np.ndarray, top_k: int, temperature: float,
+                               top_p: float = None, required_nonzero: int = None) -> np.ndarray:
         """
-        Reweight probabilities by temperature and optionally mask to top-k.
-        Ensures the returned distribution sums to 1 and falls back to uniform if needed.
+        Reweight probabilities using proper temperature scaling and nucleus sampling.
+
+        Temperature is correctly applied to log-odds (logits), not raw probabilities.
+        This gives proper Boltzmann distribution behavior.
+
+        Args:
+            probs: Raw probability predictions from model
+            top_k: Keep only top-k highest probability numbers
+            temperature: Controls sampling randomness (lower = more deterministic)
+            top_p: Nucleus sampling threshold - keep smallest set summing to top_p
+            required_nonzero: Minimum non-zero entries needed for sampling
         """
         probs = np.array(probs, dtype=np.float64)
-        if top_k and top_k < probs.size:
-            top_indices = np.argpartition(probs, -top_k)[-top_k:]
+        probs = np.clip(probs, 1e-10, 1.0 - 1e-10)  # Avoid log(0)
+
+        # Convert to logits (log-odds) for proper temperature scaling
+        logits = np.log(probs / (1 - probs))
+
+        # Apply temperature to logits (proper Boltzmann scaling)
+        if temperature and temperature > 0:
+            logits = logits / temperature
+
+        # Convert back to probabilities via softmax
+        exp_logits = np.exp(logits - np.max(logits))  # Subtract max for numerical stability
+        probs = exp_logits / np.sum(exp_logits)
+
+        effective_top_k = top_k if top_k else probs.size
+        if required_nonzero is not None:
+            effective_top_k = max(effective_top_k, required_nonzero)
+
+        # Apply nucleus (top-p) sampling if specified
+        if top_p is not None and 0 < top_p < 1:
+            sorted_indices = np.argsort(probs)[::-1]
+            cumsum = np.cumsum(probs[sorted_indices])
+            cutoff_idx = np.searchsorted(cumsum, top_p) + 1
+            cutoff_idx = max(cutoff_idx, required_nonzero or 1)
+            nucleus_indices = sorted_indices[:cutoff_idx]
+            mask = np.zeros_like(probs)
+            mask[nucleus_indices] = 1.0
+            probs = probs * mask
+        # Apply top-k masking
+        elif effective_top_k and effective_top_k < probs.size:
+            top_indices = np.argpartition(probs, -effective_top_k)[-effective_top_k:]
             mask = np.zeros_like(probs)
             mask[top_indices] = 1.0
             probs = probs * mask
-        if temperature and temperature > 0:
-            probs = np.power(probs, 1.0 / temperature)
+
         total = probs.sum()
         if total <= 0:
+            probs = np.ones_like(probs)
+            total = probs.sum()
+        # Ensure we have enough non-zero entries to sample without replacement
+        if required_nonzero is not None and np.count_nonzero(probs) < required_nonzero:
             probs = np.ones_like(probs)
             total = probs.sum()
         return probs / total
 
     def predict(self, recent_data: pd.DataFrame, num_predictions: int = 5) -> List[Dict]:
-        """Generate predictions using probabilistic sampling."""
+        """Generate predictions using probabilistic sampling with enhanced features."""
         if not self.models_loaded:
             raise ValueError("Models not loaded. Call build_models() and optionally train().")
-            
+
         from .data import LotteryDataManager
         dm = LotteryDataManager()
         # 1. Calculate all features
         main_gaps, bonus_gaps = dm.calculate_gap_states(recent_data, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE)
+        main_gap_delta, bonus_gap_delta = dm.calculate_gap_delta_features(recent_data)
         freq_features = dm.calculate_frequency_features(recent_data)
         date_features = dm.calculate_date_features(recent_data)
         main_hot_cold, bonus_hot_cold = dm.calculate_hot_cold_features(recent_data)
         main_affinity, bonus_affinity = dm.calculate_cooccurrence_features(recent_data)
         global_features = dm.calculate_global_features(recent_data)
-        
-        # 2. Stack Features (Same order as training)
-        # Main
+
+        # New advanced features
+        main_var_ent, bonus_var_ent = dm.calculate_variance_entropy_features(recent_data)
+        main_momentum, bonus_momentum = dm.calculate_momentum_features(recent_data)
+        spread_features = dm.calculate_spread_features(recent_data)
+
+        # 2. Stack Features (MUST match order in _prepare_sequences)
+        # Main: gaps, gap_deltas, freqs, date, hot_cold, affinity, global, var_ent, momentum, spread
         main_feats_list = [main_gaps]
+        for w in sorted(main_gap_delta.keys()):
+            main_feats_list.append(main_gap_delta[w])
         for w in [10, 50, 100]:
             main_feats_list.append(freq_features[f'main_freq_{w}'])
         main_feats_list.append(date_features)
         main_feats_list.append(main_hot_cold)
         main_feats_list.append(main_affinity)
         main_feats_list.append(global_features)
+        main_feats_list.append(main_var_ent)
+        main_feats_list.append(main_momentum)
+        main_feats_list.append(spread_features)
         main_features = np.hstack(main_feats_list)
-        
-        # Bonus
+
+        # Bonus: gaps, gap_deltas, freqs, date, hot_cold, affinity, global, var_ent, momentum, spread
         bonus_feats_list = [bonus_gaps]
+        for w in sorted(bonus_gap_delta.keys()):
+            bonus_feats_list.append(bonus_gap_delta[w])
         for w in [10, 50, 100]:
             bonus_feats_list.append(freq_features[f'bonus_freq_{w}'])
         bonus_feats_list.append(date_features)
         bonus_feats_list.append(bonus_hot_cold)
         bonus_feats_list.append(bonus_affinity)
         bonus_feats_list.append(global_features)
+        bonus_feats_list.append(bonus_var_ent)
+        bonus_feats_list.append(bonus_momentum)
+        bonus_feats_list.append(spread_features)
         bonus_features = np.hstack(bonus_feats_list)
         
         seq_len = self.params['sequence_length']
@@ -491,22 +640,26 @@ class NeuralModel:
                 main_probs_raw,
                 top_k=self.sampling.get("top_k_main"),
                 temperature=self.sampling.get("temperature_main"),
+                top_p=self.sampling.get("top_p_main"),
+                required_nonzero=N_MAIN
             )
             main_prob_vector = main_probs.copy()
-            
+
             main_nums = np.random.choice(
                 np.arange(1, MAIN_NUMBER_RANGE + 1),
                 size=N_MAIN,
                 replace=False,
                 p=main_probs
             )
-            
+
             # Predict Bonus
             bonus_probs_raw = self.bonus_model.predict(current_bonus_seq, verbose=0)[0]
             bonus_probs = self._apply_sampling_bias(
                 bonus_probs_raw,
                 top_k=self.sampling.get("top_k_bonus"),
                 temperature=self.sampling.get("temperature_bonus"),
+                top_p=self.sampling.get("top_p_bonus"),
+                required_nonzero=N_BONUS
             )
             bonus_prob_vector = bonus_probs.copy()
             
