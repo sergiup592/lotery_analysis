@@ -203,8 +203,9 @@ class RandomForestModel:
                 row_features.append(main_gap_delta[w][i])
             for w in sorted(bonus_gap_delta.keys()):
                 row_features.append(bonus_gap_delta[w][i])
-            for v in freq_features.values():
-                row_features.append(v[i])
+            # CRITICAL: Use sorted keys to ensure deterministic ordering (matches build_feature_vector_for_next_draw)
+            for k in sorted(freq_features.keys()):
+                row_features.append(freq_features[k][i])
 
             row_features.append(date_features[i])
             row_features.append(main_hot_cold[i])
@@ -241,4 +242,9 @@ class RandomForestModel:
                     bonus_target[num-1] = 1
             y_bonus.append(bonus_target)
 
-        return np.array(X), np.array(y_main), np.array(y_bonus)
+        X_array = np.array(X)
+        # Log first sample's feature size for debugging alignment with build_feature_vector_for_next_draw
+        if len(X_array) > 0:
+            logger.debug(f"Training feature vector size: {X_array.shape[1]}")
+        
+        return X_array, np.array(y_main), np.array(y_bonus)

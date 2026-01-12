@@ -244,8 +244,9 @@ class XGBoostModel:
             for w in sorted(bonus_gap_delta.keys()):
                 row_features.append(bonus_gap_delta[w][i])
 
-            for v in freq_features.values():
-                row_features.append(v[i])
+            # CRITICAL: Use sorted keys to ensure deterministic ordering (matches build_feature_vector_for_next_draw)
+            for k in sorted(freq_features.keys()):
+                row_features.append(freq_features[k][i])
 
             row_features.append(date_features[i])
             row_features.append(main_hot_cold[i])

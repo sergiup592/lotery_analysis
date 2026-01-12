@@ -482,65 +482,104 @@ class LotteryDataManager:
         """
         from .config import MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE
 
-        main_gaps, bonus_gaps = self.calculate_gap_states(data, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE)
-        freq_features = self.calculate_frequency_features(data)
-        main_hot_cold, bonus_hot_cold = self.calculate_hot_cold_features(data)
-        main_gap_delta, bonus_gap_delta = self.calculate_gap_delta_features(data)
-
-        # New advanced features
-        main_var_ent, bonus_var_ent = self.calculate_variance_entropy_features(data)
-        main_momentum, bonus_momentum = self.calculate_momentum_features(data)
-        spread_features = self.calculate_spread_features(data)
-
-        last_main_gap = main_gaps[-1]
-        last_bonus_gap = bonus_gaps[-1]
-        last_freqs = [v[-1] for v in freq_features.values()]
-        last_main_hc = main_hot_cold[-1]
-        last_bonus_hc = bonus_hot_cold[-1]
-
-        # New feature values
-        last_main_var_ent = main_var_ent[-1]
-        last_bonus_var_ent = bonus_var_ent[-1]
-        last_main_momentum = main_momentum[-1]
-        last_bonus_momentum = bonus_momentum[-1]
-        last_spread = spread_features[-1]
-
-        # Project next draw date (assuming weekly draws)
+        # 1. Augment data with dummy row for next draw
+        # We must do this FIRST so that rolling window calculations (which shift by 1)
+        # correctly produce values for this new row based on the actual history.
         last_date_val = data.iloc[-1]['date']
         next_date = last_date_val + pd.Timedelta(days=7)
 
         dummy_row = pd.DataFrame([{
             'date': next_date,
-            'main_numbers': [],
+            'main_numbers': [],  # Empty lists for numbers
             'bonus_numbers': [],
             'jackpot': '',
             'result': ''
         }])
         data_augmented = pd.concat([data, dummy_row], ignore_index=True)
 
-        # Recalculate date features for the augmented data to get the next date's features
-        date_features_aug = self.calculate_date_features(data_augmented)
-        target_date_feat = date_features_aug[-1]
+        # 2. Calculate features on augmented data
+        # Note: All feature identifiers (gaps, freq, etc.) will calculate values
+        # for all rows. We only care about the values for the LAST row (the dummy one).
+        
+        # Gaps
+        main_gaps, bonus_gaps = self.calculate_gap_states(data_augmented, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE)
+        
+        # Frequency
+        freq_features = self.calculate_frequency_features(data_augmented)
+        
+        # Hot/Cold
+        main_hot_cold, bonus_hot_cold = self.calculate_hot_cold_features(data_augmented)
+        
+        # Gap Deltas
+        main_gap_delta, bonus_gap_delta = self.calculate_gap_delta_features(data_augmented)
 
-        main_aff_aug, bonus_aff_aug = self.calculate_cooccurrence_features(data_augmented)
-        global_feats_aug = self.calculate_global_features(data_augmented)
+        # Advanced Features
+        main_var_ent, bonus_var_ent = self.calculate_variance_entropy_features(data_augmented)
+        main_momentum, bonus_momentum = self.calculate_momentum_features(data_augmented)
+        spread_features = self.calculate_spread_features(data_augmented)
+        
+        # Co-occurrence & Global
+        main_affinity, bonus_affinity = self.calculate_cooccurrence_features(data_augmented)
+        global_features = self.calculate_global_features(data_augmented)
+        
+        # Date Features
+        date_features = self.calculate_date_features(data_augmented)
 
-        last_main_affinity = main_aff_aug[-1]
-        last_bonus_affinity = bonus_aff_aug[-1]
-        last_global = global_feats_aug[-1]
+        # 3. Extract features for the last row (index -1)
+        last_main_gap = main_gaps[-1]
+        last_bonus_gap = bonus_gaps[-1]
+        
+        # Unpack dicts in sorted order of keys
+        last_gap_deltas_main = [main_gap_delta[w][-1] for w in sorted(main_gap_delta.keys())]
+        last_gap_deltas_bonus = [bonus_gap_delta[w][-1] for w in sorted(bonus_gap_delta.keys())]
+        
+        # CRITICAL: Use sorted keys to ensure deterministic ordering between training and inference.
+        # This prevents feature misalignment bugs caused by dictionary iteration order.
+        sorted_freq_keys = sorted(freq_features.keys())
+        last_freqs = [freq_features[k][-1] for k in sorted_freq_keys]
+        
+        last_main_hc = main_hot_cold[-1]
+        last_bonus_hc = bonus_hot_cold[-1]
+        
+        last_main_aff = main_affinity[-1]
+        last_bonus_aff = bonus_affinity[-1]
+        
+        last_global = global_features[-1]
+        
+        last_main_ve = main_var_ent[-1]
+        last_bonus_ve = bonus_var_ent[-1]
+        
+        last_main_mom = main_momentum[-1]
+        last_bonus_mom = bonus_momentum[-1]
+        
+        last_spread = spread_features[-1]
+        
+        last_date = date_features[-1]
 
-        return np.hstack([
+        # 4. Stack into single vector
+        # ORDER MUST MATCH `src/tree.py` _prepare_data
+        # [gaps, gap_deltas(sorted keys), freqs(sorted keys), date, hot_cold, affinity, global, var_ent, momentum, spread]
+        
+        feature_vector = np.hstack([
             last_main_gap, last_bonus_gap,
-            *[main_gap_delta[w][-1] for w in sorted(main_gap_delta.keys())],
-            *[bonus_gap_delta[w][-1] for w in sorted(bonus_gap_delta.keys())],
+            *last_gap_deltas_main,
+            *last_gap_deltas_bonus,
             *last_freqs,
-            target_date_feat,
+            last_date,
             last_main_hc, last_bonus_hc,
-            last_main_affinity, last_bonus_affinity,
+            last_main_aff, last_bonus_aff,
             last_global,
-            last_main_var_ent,       # Variance/Entropy features
-            last_bonus_var_ent,
-            last_main_momentum,      # Momentum features
-            last_bonus_momentum,
-            last_spread              # Spread features
+            last_main_ve, last_bonus_ve,
+            last_main_mom, last_bonus_mom,
+            last_spread
         ])
+        
+        # Runtime validation: log feature vector size for debugging
+        # Expected size breakdown (approximate, depends on config):
+        # main_gap: 50, bonus_gap: 12, gap_deltas: 3*50 + 3*12 = 186, freqs: 6 windows * (50+12) = 372
+        # date: 19, hot_cold: 2*(50+12) = 124, affinity: 50+12 = 62, global: 9
+        # var_ent: 2+2 = 4, momentum: 50+12 = 62, spread: 3
+        logger.debug(f"Feature vector size for next draw: {len(feature_vector)}")
+        
+        return feature_vector
+

@@ -47,7 +47,7 @@ class StatisticalModel:
             for num in numbers:
                 if 1 <= num <= number_range:
                     counts[num-1] += 1
-                total_picks += 1
+                    total_picks += 1  # Only count valid numbers
                     
         if total_picks == 0:
             return counts

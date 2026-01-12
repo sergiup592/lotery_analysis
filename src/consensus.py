@@ -11,10 +11,11 @@ class ConsensusEngine:
 
     def __init__(self):
         self.base_weights = {
-            'Neural_Transformer': 0.35,  # Slightly reduced to balance with other models
-            'XGBoost': 0.30,
-            'RandomForest': 0.25,        # Increased from 0.2
-            'Statistical': 0.10
+            'Neural_Transformer': 0.30,  # Adjusted
+            'XGBoost': 0.25,
+            'RandomForest': 0.20,
+            'Statistical': 0.10,
+            'Ensemble': 0.15             # Added Ensemble source
         }
         self.filter = StatisticalFilter()
         # Adaptive weighting parameters
@@ -44,14 +45,17 @@ class ConsensusEngine:
                 if not is_valid:
                     continue
                 
+                # IMPORTANT: Create a copy to avoid mutating the original prediction dict
+                p_copy = p.copy()
+                
                 # Apply Soft Validation Rules (Score Adjustment)
-                weight = self.base_weights.get(p['source'], 0.1)
-                base_score = p['confidence'] * weight
-                density_boost = self._expected_hit_boost(p)
-                final_score = self._apply_validation_rules(p, base_score * density_boost)
-                p['final_score'] = final_score
-                valid_preds.append(p)
-                source_conf.setdefault(source, []).append(p['confidence'])
+                weight = self.base_weights.get(p_copy['source'], 0.1)
+                base_score = p_copy['confidence'] * weight
+                density_boost = self._expected_hit_boost(p_copy)
+                final_score = self._apply_validation_rules(p_copy, base_score * density_boost)
+                p_copy['final_score'] = final_score
+                valid_preds.append(p_copy)
+                source_conf.setdefault(source, []).append(p_copy['confidence'])
             
             # Sort by score descending
             valid_preds.sort(key=lambda x: x['final_score'], reverse=True)
