@@ -29,6 +29,13 @@ def configure_tensorflow() -> bool:
                     tf.config.experimental.set_memory_growth(gpu, True)
                 except Exception:
                     pass
+            if os.environ.get("TF_MIXED_PRECISION", "1") != "0":
+                try:
+                    from tensorflow.keras import mixed_precision
+                    mixed_precision.set_global_policy("mixed_float16")
+                    logger.info("TensorFlow mixed precision enabled.")
+                except Exception as exc:
+                    logger.info("Failed to enable mixed precision: %s", exc)
             logger.info("TensorFlow GPU(s) available: %s", [gpu.name for gpu in gpus])
             _TF_CONFIGURED = True
             return True
@@ -38,6 +45,19 @@ def configure_tensorflow() -> bool:
 
     _TF_CONFIGURED = True
     return False
+
+
+def maybe_wrap_optimizer(optimizer):
+    """Wrap optimizer with loss scaling when mixed precision is enabled."""
+    try:
+        import tensorflow as tf
+        from tensorflow.keras import mixed_precision
+        policy = mixed_precision.global_policy()
+        if policy.compute_dtype == "float16":
+            return mixed_precision.LossScaleOptimizer(optimizer)
+    except Exception:
+        pass
+    return optimizer
 
 
 def get_xgboost_device_params() -> Dict[str, str]:

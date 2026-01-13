@@ -7,7 +7,7 @@ import numpy as np
 import logging
 import pandas as pd
 from typing import Dict, Tuple, List
-from .acceleration import configure_tensorflow
+from .acceleration import configure_tensorflow, maybe_wrap_optimizer
 from .config import (
     NEURAL_MODEL_PARAMS,
     NEURAL_ARCH_CONFIG,
@@ -177,7 +177,7 @@ class NeuralModel:
         x = Dropout(max(dropout_rate, 0.1))(x)
         
         # Output probability for each number
-        out = Dense(output_size, activation='sigmoid', name=f'{name}_output')(x)
+        out = Dense(output_size, activation='sigmoid', name=f'{name}_output', dtype='float32')(x)
         
         model = Model(inputs=inp, outputs=out, name=f'{name}_transformer')
         loss_fn = tf.keras.losses.BinaryCrossentropy(label_smoothing=label_smoothing)
@@ -196,7 +196,7 @@ class NeuralModel:
         x = Dense(d_model)(inp)
         x = GlobalAveragePooling1D()(x)
         x = Dense(64, activation='relu')(x)
-        out = Dense(1, name=f'{name}_output')(x) # Linear output for Value
+        out = Dense(1, name=f'{name}_output', dtype='float32')(x) # Linear output for Value
         
         model = Model(inputs=inp, outputs=out, name=f'{name}_model')
         model.compile(optimizer=Adam(learning_rate=self.params['learning_rate']), loss='mse')
@@ -326,6 +326,8 @@ class NeuralModel:
         
         sequences, main_targets, bonus_targets = self._prepare_sequences(data)
         main_seqs, bonus_seqs = sequences
+        main_targets_tf = tf.convert_to_tensor(main_targets, dtype=tf.float32)
+        bonus_targets_tf = tf.convert_to_tensor(bonus_targets, dtype=tf.float32)
         
         # Hyperparameters
         from .config import PPO_PARAMS
@@ -336,8 +338,8 @@ class NeuralModel:
         lam = PPO_PARAMS['lam']
         entropy_coef = PPO_PARAMS['entropy_coef']
         
-        main_optimizer = Adam(learning_rate=PPO_PARAMS['learning_rate'])
-        bonus_optimizer = Adam(learning_rate=PPO_PARAMS['learning_rate'])
+        main_optimizer = maybe_wrap_optimizer(Adam(learning_rate=PPO_PARAMS['learning_rate']))
+        bonus_optimizer = maybe_wrap_optimizer(Adam(learning_rate=PPO_PARAMS['learning_rate']))
         
         batch_size = PPO_PARAMS['batch_size']
         n_batches = len(main_seqs) // batch_size
@@ -365,10 +367,13 @@ class NeuralModel:
             
             for b in range(n_batches):
                 batch_idx = indices[b*batch_size : (b+1)*batch_size]
+                batch_idx_tf = tf.convert_to_tensor(batch_idx, dtype=tf.int32)
                 
                 # Get batch data
                 states_main = main_seqs[batch_idx]
                 states_bonus = bonus_seqs[batch_idx]
+                targets_main = tf.gather(main_targets_tf, batch_idx_tf)
+                targets_bonus = tf.gather(bonus_targets_tf, batch_idx_tf)
                 
                 # 1. Rollout (Collect Trajectories)
                 # We need "Old" probabilities for PPO ratio
@@ -383,74 +388,73 @@ class NeuralModel:
                 main_actions = tf.random.categorical(tf.math.log(old_main_probs_norm + 1e-9), num_samples=N_MAIN)
                 bonus_actions = tf.random.categorical(tf.math.log(old_bonus_probs_norm + 1e-9), num_samples=N_BONUS)
                 
-                # Calculate Enhanced Rewards with near-miss detection
-                rewards = []
-                for i in range(batch_size):
-                    # Main Reward
-                    selected_main = set(main_actions[i].numpy() + 1)
-                    true_main = set(np.where(main_targets[batch_idx[i]] == 1)[0] + 1)
-                    hits = len(selected_main & true_main)
+                # Calculate Enhanced Rewards with near-miss detection (vectorized)
+                main_actions = tf.cast(main_actions, tf.int32)
+                bonus_actions = tf.cast(bonus_actions, tf.int32)
+                selected_main_oh = tf.reduce_max(
+                    tf.one_hot(main_actions, depth=MAIN_NUMBER_RANGE, dtype=tf.float32),
+                    axis=1
+                )
+                selected_bonus_oh = tf.reduce_max(
+                    tf.one_hot(bonus_actions, depth=BONUS_NUMBER_RANGE, dtype=tf.float32),
+                    axis=1
+                )
+                true_main_oh = tf.cast(targets_main, tf.float32)
+                true_bonus_oh = tf.cast(targets_bonus, tf.float32)
 
-                    # Bonus Reward
-                    selected_bonus = set(bonus_actions[i].numpy() + 1)
-                    true_bonus = set(np.where(bonus_targets[batch_idx[i]] == 1)[0] + 1)
-                    bonus_hits = len(selected_bonus & true_bonus)
+                hits = tf.reduce_sum(selected_main_oh * true_main_oh, axis=1)
+                bonus_hits = tf.reduce_sum(selected_bonus_oh * true_bonus_oh, axis=1)
 
-                    # Base reward (exponential scaling for hits)
-                    r = 0.0
-                    if hits > 0:
-                        r += (2.0 ** hits) - 1.0  # Exponential: 1, 3, 7, 15, 31 for 1-5 hits
-                    if bonus_hits > 0:
-                        r += (1.5 ** bonus_hits) * 2.0  # Bonus hits worth more
+                main_reward = tf.where(hits > 0, tf.pow(2.0, hits) - 1.0, tf.zeros_like(hits))
+                bonus_reward = tf.where(
+                    bonus_hits > 0,
+                    tf.pow(1.5, bonus_hits) * 2.0,
+                    tf.zeros_like(bonus_hits),
+                )
+                rewards = main_reward + bonus_reward
 
-                    # Near-miss reward: reward numbers that were off by 1 or 2
-                    # This helps the model learn to concentrate probability mass near correct numbers
-                    near_miss_main = 0
-                    for sel in selected_main:
-                        for true in true_main:
-                            diff = abs(sel - true)
-                            if diff == 1:
-                                near_miss_main += 0.3  # Adjacent number
-                            elif diff == 2:
-                                near_miss_main += 0.1  # Two away
-                    r += near_miss_main
+                shift1_left = tf.pad(true_main_oh[:, 1:], [[0, 0], [0, 1]])
+                shift1_right = tf.pad(true_main_oh[:, :-1], [[0, 0], [1, 0]])
+                shift2_left = tf.pad(true_main_oh[:, 2:], [[0, 0], [0, 2]])
+                shift2_right = tf.pad(true_main_oh[:, :-2], [[0, 0], [2, 0]])
+                near_miss_main = 0.3 * tf.reduce_sum(selected_main_oh * (shift1_left + shift1_right), axis=1)
+                near_miss_main += 0.1 * tf.reduce_sum(selected_main_oh * (shift2_left + shift2_right), axis=1)
 
-                    near_miss_bonus = 0
-                    for sel in selected_bonus:
-                        for true in true_bonus:
-                            diff = abs(sel - true)
-                            if diff == 1:
-                                near_miss_bonus += 0.4
-                            elif diff == 2:
-                                near_miss_bonus += 0.15
-                    r += near_miss_bonus
+                shift1_left_b = tf.pad(true_bonus_oh[:, 1:], [[0, 0], [0, 1]])
+                shift1_right_b = tf.pad(true_bonus_oh[:, :-1], [[0, 0], [1, 0]])
+                shift2_left_b = tf.pad(true_bonus_oh[:, 2:], [[0, 0], [0, 2]])
+                shift2_right_b = tf.pad(true_bonus_oh[:, :-2], [[0, 0], [2, 0]])
+                near_miss_bonus = 0.4 * tf.reduce_sum(selected_bonus_oh * (shift1_left_b + shift1_right_b), axis=1)
+                near_miss_bonus += 0.15 * tf.reduce_sum(selected_bonus_oh * (shift2_left_b + shift2_right_b), axis=1)
 
-                    # Probability calibration bonus - reward confident correct predictions
-                    selected_main_indices = np.array(list(selected_main)) - 1
-                    selected_bonus_indices = np.array(list(selected_bonus)) - 1
-                    selected_main_probs = old_main_probs_norm[i].numpy()[selected_main_indices]
-                    selected_bonus_probs = old_bonus_probs_norm[i].numpy()[selected_bonus_indices]
-                    prob_confidence = float(np.mean(selected_main_probs)) + float(np.mean(selected_bonus_probs))
+                rewards += near_miss_main + near_miss_bonus
 
-                    # If prediction was correct AND confident, big bonus
-                    if hits >= 2:
-                        r += prob_confidence * 5.0
-                    elif hits >= 1:
-                        r += prob_confidence * 2.0
+                selected_main_count = tf.reduce_sum(selected_main_oh, axis=1)
+                selected_bonus_count = tf.reduce_sum(selected_bonus_oh, axis=1)
+                main_conf = tf.math.divide_no_nan(
+                    tf.reduce_sum(old_main_probs_norm * selected_main_oh, axis=1),
+                    selected_main_count,
+                )
+                bonus_conf = tf.math.divide_no_nan(
+                    tf.reduce_sum(old_bonus_probs_norm * selected_bonus_oh, axis=1),
+                    selected_bonus_count,
+                )
+                prob_confidence = main_conf + bonus_conf
 
-                    # Penalty for overconfident wrong predictions
-                    if hits == 0 and prob_confidence > 0.6:
-                        r -= 2.0
+                rewards += tf.where(hits >= 2, prob_confidence * 5.0, tf.zeros_like(rewards))
+                rewards += tf.where(
+                    tf.logical_and(hits >= 1, hits < 2),
+                    prob_confidence * 2.0,
+                    tf.zeros_like(rewards),
+                )
 
-                    # Baseline subtraction: subtract expected random performance
-                    # Random chance of hitting k main numbers follows hypergeometric distribution
-                    # Expected hits for random = N_MAIN * (N_MAIN / MAIN_NUMBER_RANGE) = 5 * (5/50) = 0.5
-                    baseline_reward = 0.5
-                    r -= baseline_reward
+                rewards += tf.where(
+                    tf.logical_and(hits == 0, prob_confidence > 0.6),
+                    tf.constant(-2.0, dtype=rewards.dtype),
+                    tf.zeros_like(rewards),
+                )
 
-                    rewards.append(r)
-                
-                rewards = tf.convert_to_tensor(rewards, dtype=tf.float32)
+                rewards -= 0.5
                 
                 # Calculate Advantages (TD error / GAE for length-1 trajectories)
                 values_main = self.main_critic(states_main)

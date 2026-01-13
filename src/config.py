@@ -21,7 +21,7 @@ for directory in [MODELS_DIR, LOGS_DIR, PREDICTIONS_DIR]:
 # Model Configuration
 NEURAL_MODEL_PARAMS = {
     "sequence_length": 20,
-    "batch_size": 16,
+    "batch_size": 64,
     "epochs": 300,
     "learning_rate": 0.0005
 }
