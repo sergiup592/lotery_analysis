@@ -20,19 +20,19 @@ for directory in [MODELS_DIR, LOGS_DIR, PREDICTIONS_DIR]:
 
 # Model Configuration
 NEURAL_MODEL_PARAMS = {
-    "sequence_length": 10,
-    "batch_size": 32,
-    "epochs": 120,
-    "learning_rate": 0.001
+    "sequence_length": 20,
+    "batch_size": 16,
+    "epochs": 300,
+    "learning_rate": 0.0005
 }
 
 # Transformer architecture scaling
 NEURAL_ARCH_CONFIG = {
-    "d_model": 256,          # base hidden size (was 192)
-    "num_layers": 8,         # transformer encoder layers (was 6)
-    "num_heads": 8,          # attention heads (was 4)
-    "ff_multiplier": 2.0,    # feed-forward expansion
-    "dropout": 0.1,          # dropout inside blocks
+    "d_model": 512,          # base hidden size (aggressive)
+    "num_layers": 16,        # transformer encoder layers (aggressive)
+    "num_heads": 16,         # attention heads (aggressive)
+    "ff_multiplier": 4.0,    # feed-forward expansion
+    "dropout": 0.15,         # dropout inside blocks
     "label_smoothing": 0.05  # helps calibration and reduces overconfidence
 }
 
@@ -47,7 +47,8 @@ PPO_PARAMS = {
     "gamma": 0.99,
     "lam": 0.95,
     "entropy_coef": 0.05,    # Increased from 0.02 for better exploration
-    "batch_size": 64
+    "batch_size": 32,
+    "epochs": 200
 }
 
 # Sampling configuration (used for all model samplers)

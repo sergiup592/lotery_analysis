@@ -5,6 +5,7 @@ import logging
 from typing import List, Dict, Tuple
 from .config import N_MAIN, N_BONUS, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE, SAMPLING_CONFIG
 from .data import LotteryDataManager
+from .acceleration import get_xgboost_device_params
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ class XGBoostModel:
         self.bonus_models = []
         self.is_trained = False
         self.sampling = SAMPLING_CONFIG
+        self.device_params = get_xgboost_device_params()
         
     def train(self, data: pd.DataFrame):
         """Train the XGBoost models."""
@@ -40,18 +42,23 @@ class XGBoostModel:
         for i in range(MAIN_NUMBER_RANGE):
             # Target: Did number i+1 appear?
             y = y_main_train[:, i]
+            pos = float(np.sum(y))
+            neg = float(len(y) - pos)
+            scale_pos_weight = (neg / pos) if pos > 0 else 1.0
+            scale_pos_weight = float(np.clip(scale_pos_weight, 1.0, 50.0))
             
             model = xgb.XGBClassifier(
-                n_estimators=300,
-                max_depth=6,
-                learning_rate=0.04,
+                n_estimators=800,
+                max_depth=8,
+                learning_rate=0.03,
                 subsample=0.8,
                 colsample_bytree=0.8,
                 objective='binary:logistic',
+                scale_pos_weight=scale_pos_weight,
                 n_jobs=-1,
                 eval_metric='logloss',
                 random_state=42,
-                tree_method='hist'
+                **self.device_params
             )
             model.fit(
                 X_train,
@@ -65,18 +72,23 @@ class XGBoostModel:
         self.bonus_models = []
         for i in range(BONUS_NUMBER_RANGE):
             y = y_bonus_train[:, i]
+            pos = float(np.sum(y))
+            neg = float(len(y) - pos)
+            scale_pos_weight = (neg / pos) if pos > 0 else 1.0
+            scale_pos_weight = float(np.clip(scale_pos_weight, 1.0, 50.0))
             
             model = xgb.XGBClassifier(
-                n_estimators=220,
-                max_depth=4,
-                learning_rate=0.04,
+                n_estimators=500,
+                max_depth=6,
+                learning_rate=0.03,
                 subsample=0.85,
                 colsample_bytree=0.9,
                 objective='binary:logistic',
+                scale_pos_weight=scale_pos_weight,
                 n_jobs=-1,
                 eval_metric='logloss',
                 random_state=42,
-                tree_method='hist'
+                **self.device_params
             )
             model.fit(
                 X_train,

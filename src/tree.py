@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 import logging
 from typing import List, Dict, Tuple
 from .config import N_MAIN, N_BONUS, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE, SAMPLING_CONFIG
@@ -33,8 +33,11 @@ class RandomForestModel:
         
         # Main Numbers Model
         self.main_model = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=14,
+            n_estimators=800,
+            max_depth=22,
+            min_samples_split=3,
+            min_samples_leaf=1,
+            class_weight="balanced_subsample",
             random_state=42,
             n_jobs=-1
         )
@@ -42,8 +45,11 @@ class RandomForestModel:
         
         # Bonus Numbers Model
         self.bonus_model = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=10,
+            n_estimators=600,
+            max_depth=16,
+            min_samples_split=3,
+            min_samples_leaf=1,
+            class_weight="balanced_subsample",
             random_state=42,
             n_jobs=-1
         )
@@ -59,6 +65,7 @@ class RandomForestModel:
         Temperature is applied to logits for proper Boltzmann distribution.
         """
         probs = np.array(probs, dtype=np.float64)
+        probs = np.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
         probs = np.clip(probs, 1e-10, 1.0 - 1e-10)
 
         # Convert to logits for proper temperature scaling
@@ -99,6 +106,21 @@ class RandomForestModel:
             probs = np.ones_like(probs)
             total = probs.sum()
         return probs / total
+
+    def _extract_positive_class_probs(self, probs_list: List[np.ndarray], classes_list: List[np.ndarray]) -> np.ndarray:
+        """Extract P(class=1) for each output, even when only one class was seen."""
+        probs = np.zeros(len(probs_list), dtype=np.float64)
+        for i, prob in enumerate(probs_list):
+            classes = np.asarray(classes_list[i])
+            if classes.size == 0:
+                probs[i] = 0.0
+                continue
+            if 1 in classes:
+                class_idx = int(np.where(classes == 1)[0][0])
+                probs[i] = prob[0, class_idx]
+            else:
+                probs[i] = 0.0
+        return probs
         
     def predict(self, data: pd.DataFrame, num_predictions: int = 5) -> List[Dict]:
         """Generate predictions using the trained model."""
@@ -113,10 +135,10 @@ class RandomForestModel:
         # Predict Probabilities
         main_probs_list = self.main_model.predict_proba(X_next)
         bonus_probs_list = self.bonus_model.predict_proba(X_next)
-        
+
         # Extract probability of class 1 (being selected) for each number
-        main_probs = np.array([probs[0, 1] if probs.shape[1] > 1 else 0.0 for probs in main_probs_list])
-        bonus_probs = np.array([probs[0, 1] if probs.shape[1] > 1 else 0.0 for probs in bonus_probs_list])
+        main_probs = self._extract_positive_class_probs(main_probs_list, self.main_model.classes_)
+        bonus_probs = self._extract_positive_class_probs(bonus_probs_list, self.bonus_model.classes_)
         
         # Reweight distribution to emphasize top candidates
         main_probs = self._apply_sampling_bias(
@@ -248,3 +270,42 @@ class RandomForestModel:
             logger.debug(f"Training feature vector size: {X_array.shape[1]}")
         
         return X_array, np.array(y_main), np.array(y_bonus)
+
+
+class ExtraTreesModel(RandomForestModel):
+    """Extra Trees Model for Lottery Prediction (more randomized splits)."""
+
+    def train(self, data: pd.DataFrame):
+        """Train the Extra Trees models."""
+        logger.info("Training Extra Trees Model...")
+
+        X, y_main, y_bonus = self._prepare_data(data)
+        if len(X) == 0:
+            raise ValueError("Not enough data to train ExtraTreesModel.")
+
+        # Main Numbers Model
+        self.main_model = ExtraTreesClassifier(
+            n_estimators=1200,
+            max_depth=24,
+            min_samples_split=3,
+            min_samples_leaf=1,
+            class_weight="balanced_subsample",
+            random_state=42,
+            n_jobs=-1
+        )
+        self.main_model.fit(X, y_main)
+
+        # Bonus Numbers Model
+        self.bonus_model = ExtraTreesClassifier(
+            n_estimators=800,
+            max_depth=18,
+            min_samples_split=3,
+            min_samples_leaf=1,
+            class_weight="balanced_subsample",
+            random_state=42,
+            n_jobs=-1
+        )
+        self.bonus_model.fit(X, y_bonus)
+
+        self.is_trained = True
+        logger.info("Extra Trees training complete.")

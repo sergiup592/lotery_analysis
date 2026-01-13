@@ -7,6 +7,7 @@ import numpy as np
 import logging
 import pandas as pd
 from typing import Dict, Tuple, List
+from .acceleration import configure_tensorflow
 from .config import (
     NEURAL_MODEL_PARAMS,
     NEURAL_ARCH_CONFIG,
@@ -37,6 +38,7 @@ class NeuralModel:
         
     def build_models(self):
         """Build or load the neural network models."""
+        configure_tensorflow()
         main_model_path = MODELS_DIR / "main_transformer.keras"
         bonus_model_path = MODELS_DIR / "bonus_transformer.keras"
 
@@ -78,10 +80,25 @@ class NeuralModel:
                 self.bonus_model = load_model(bonus_model_path)
                 
                 # Check input shape compatibility
+                expected_seq_len = self.params['sequence_length']
+                if self.main_model.input_shape[1] != expected_seq_len:
+                    logger.warning(
+                        "Main model sequence length mismatch: %s vs %s. Rebuilding...",
+                        self.main_model.input_shape[1],
+                        expected_seq_len,
+                    )
+                    raise ValueError("Sequence length mismatch")
                 if self.main_model.input_shape[-1] != self.main_input_dim:
                     logger.warning(f"Main model input shape mismatch: {self.main_model.input_shape[-1]} vs {self.main_input_dim}. Rebuilding...")
                     raise ValueError("Shape mismatch")
                     
+                if self.bonus_model.input_shape[1] != expected_seq_len:
+                    logger.warning(
+                        "Bonus model sequence length mismatch: %s vs %s. Rebuilding...",
+                        self.bonus_model.input_shape[1],
+                        expected_seq_len,
+                    )
+                    raise ValueError("Sequence length mismatch")
                 if self.bonus_model.input_shape[-1] != self.bonus_input_dim:
                     logger.warning(f"Bonus model input shape mismatch: {self.bonus_model.input_shape[-1]} vs {self.bonus_input_dim}. Rebuilding...")
                     raise ValueError("Shape mismatch")
@@ -301,7 +318,7 @@ class NeuralModel:
 
         return (np.array(sequences_main), np.array(sequences_bonus)), np.array(main_targets), np.array(bonus_targets)
 
-    def train_ppo(self, data: pd.DataFrame, epochs: int = 50):
+    def train_ppo(self, data: pd.DataFrame, epochs: int = None):
         """
         Fine-tune the model using Proximal Policy Optimization (PPO).
         """
@@ -312,6 +329,8 @@ class NeuralModel:
         
         # Hyperparameters
         from .config import PPO_PARAMS
+        if epochs is None:
+            epochs = int(PPO_PARAMS.get("epochs", 50))
         clip_ratio = PPO_PARAMS['clip_ratio']
         gamma = PPO_PARAMS['gamma']
         lam = PPO_PARAMS['lam']
@@ -579,19 +598,30 @@ class NeuralModel:
 
         from .data import LotteryDataManager
         dm = LotteryDataManager()
-        # 1. Calculate all features
-        main_gaps, bonus_gaps = dm.calculate_gap_states(recent_data, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE)
-        main_gap_delta, bonus_gap_delta = dm.calculate_gap_delta_features(recent_data)
-        freq_features = dm.calculate_frequency_features(recent_data)
-        date_features = dm.calculate_date_features(recent_data)
-        main_hot_cold, bonus_hot_cold = dm.calculate_hot_cold_features(recent_data)
-        main_affinity, bonus_affinity = dm.calculate_cooccurrence_features(recent_data)
-        global_features = dm.calculate_global_features(recent_data)
+        # 1. Add a dummy row for the next draw so the final timestep matches training alignment.
+        next_date = dm.infer_next_draw_date(recent_data)
+        dummy_row = pd.DataFrame([{
+            'date': next_date,
+            'main_numbers': [],
+            'bonus_numbers': [],
+            'jackpot': '',
+            'result': ''
+        }])
+        data_augmented = pd.concat([recent_data, dummy_row], ignore_index=True)
+
+        # 2. Calculate all features on augmented data
+        main_gaps, bonus_gaps = dm.calculate_gap_states(data_augmented, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE)
+        main_gap_delta, bonus_gap_delta = dm.calculate_gap_delta_features(data_augmented)
+        freq_features = dm.calculate_frequency_features(data_augmented)
+        date_features = dm.calculate_date_features(data_augmented)
+        main_hot_cold, bonus_hot_cold = dm.calculate_hot_cold_features(data_augmented)
+        main_affinity, bonus_affinity = dm.calculate_cooccurrence_features(data_augmented)
+        global_features = dm.calculate_global_features(data_augmented)
 
         # New advanced features
-        main_var_ent, bonus_var_ent = dm.calculate_variance_entropy_features(recent_data)
-        main_momentum, bonus_momentum = dm.calculate_momentum_features(recent_data)
-        spread_features = dm.calculate_spread_features(recent_data)
+        main_var_ent, bonus_var_ent = dm.calculate_variance_entropy_features(data_augmented)
+        main_momentum, bonus_momentum = dm.calculate_momentum_features(data_augmented)
+        spread_features = dm.calculate_spread_features(data_augmented)
 
         # 2. Stack Features (MUST match order in _prepare_sequences)
         # Main: gaps, gap_deltas, freqs, date, hot_cold, affinity, global, var_ent, momentum, spread

@@ -15,7 +15,8 @@ class ConsensusEngine:
             'XGBoost': 0.25,
             'RandomForest': 0.20,
             'Statistical': 0.10,
-            'Ensemble': 0.15             # Added Ensemble source
+            'ExtraTrees': 0.15,
+            'Ensemble': 0.12             # Added Ensemble source
         }
         self.filter = StatisticalFilter()
         # Adaptive weighting parameters

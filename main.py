@@ -3,10 +3,11 @@ import logging
 import json
 import sys
 from src.config import LOGS_DIR, PREDICTIONS_DIR
+from src.coverage import CoverageOptimizer
 from src.data import LotteryDataManager
 from src.neural import NeuralModel
 from src.statistical import StatisticalModel
-from src.tree import RandomForestModel
+from src.tree import RandomForestModel, ExtraTreesModel
 from src.xgboost_model import XGBoostModel
 from src.consensus import ConsensusEngine
 
@@ -24,6 +25,18 @@ logger = logging.getLogger(__name__)
 def main():
     parser = argparse.ArgumentParser(description="Hybrid Lottery Number Generator")
     parser.add_argument("--predictions", type=int, default=5, help="Number of predictions to generate")
+    parser.add_argument(
+        "--strategy",
+        choices=["hybrid", "coverage"],
+        default="hybrid",
+        help="Prediction strategy: model-based hybrid or coverage-optimized tickets",
+    )
+    parser.add_argument(
+        "--coverage-candidates",
+        type=int,
+        default=2000,
+        help="Random candidates per ticket for coverage strategy",
+    )
     parser.add_argument("--force-train", action="store_true", help="Force retraining of neural models")
     parser.add_argument("--rl-train", action="store_true", help="Fine-tune models using PPO (RL)")
     parser.add_argument("--backtest", action="store_true", help="Run backtesting framework")
@@ -43,6 +56,27 @@ def main():
                 use_neural=args.backtest_use_neural
             )
             bt.run()
+            return
+
+        if args.strategy == "coverage":
+            optimizer = CoverageOptimizer()
+            coverage_preds = optimizer.generate(
+                args.predictions,
+                candidates_per_ticket=args.coverage_candidates,
+            )
+            output_file = PREDICTIONS_DIR / "coverage_predictions.json"
+            with open(output_file, "w") as f:
+                json.dump(coverage_preds, f, indent=4)
+
+            print("\n=== Coverage-Optimized Tickets ===")
+            for i, pred in enumerate(coverage_preds, 1):
+                score = pred.get("coverage_score", 0.0)
+                print(f"\nPick {i} (Coverage Score: {score:.2f})")
+                print(f"Main: {pred['main_numbers']}")
+                print(f"Bonus: {pred['bonus_numbers']}")
+
+            logger.info(f"Coverage picks saved to {output_file}")
+            logger.info("=== Execution Complete ===")
             return
         
         # 1. Load Data
@@ -64,6 +98,10 @@ def main():
         # Random Forest model is fast, always train
         rf_model = RandomForestModel()
         rf_model.train(data)
+
+        # Extra Trees model adds more randomized tree diversity
+        et_model = ExtraTreesModel()
+        et_model.train(data)
         
         # XGBoost model is fast, always train
         xgb_model.train(data)
@@ -86,9 +124,10 @@ def main():
         neural_preds = neural_model.predict(data, num_predictions=n_candidates)
         stat_preds = stat_model.predict(data, num_predictions=n_candidates)
         rf_preds = rf_model.predict(data, num_predictions=n_candidates)
+        et_preds = et_model.predict(data, num_predictions=n_candidates)
         xgb_preds = xgb_model.predict(data, num_predictions=n_candidates)
         
-        all_preds = neural_preds + stat_preds + rf_preds + xgb_preds
+        all_preds = neural_preds + stat_preds + rf_preds + et_preds + xgb_preds
 
         # 5. Generate Ensemble Predictions (combines probability distributions)
         logger.info("Generating ensemble predictions...")

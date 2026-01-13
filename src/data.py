@@ -474,6 +474,30 @@ class LotteryDataManager:
 
         return rolling_spread
 
+    def infer_next_draw_date(self, data: pd.DataFrame) -> pd.Timestamp:
+        """
+        Infer the next draw date based on the most common draw weekdays in the data.
+        Falls back to +7 days if inference is not possible.
+        """
+        if data.empty:
+            raise ValueError("Cannot infer next draw date from empty data.")
+
+        last_date = data.iloc[-1]['date']
+        weekday_counts = data['date'].dt.dayofweek.value_counts()
+        if weekday_counts.empty:
+            return last_date + pd.Timedelta(days=7)
+
+        # Use top 2 draw weekdays if present (e.g., Tue/Fri). Otherwise use the single most common weekday.
+        allowed_days = list(weekday_counts.index[:2])
+        next_date = last_date + pd.Timedelta(days=1)
+        guard = 0
+        while next_date.dayofweek not in allowed_days:
+            next_date += pd.Timedelta(days=1)
+            guard += 1
+            if guard > 14:
+                return last_date + pd.Timedelta(days=7)
+        return next_date
+
     def build_feature_vector_for_next_draw(self, data: pd.DataFrame) -> np.ndarray:
         """
         Assemble the feature vector used by tree/XGBoost models for the next draw.
@@ -485,8 +509,7 @@ class LotteryDataManager:
         # 1. Augment data with dummy row for next draw
         # We must do this FIRST so that rolling window calculations (which shift by 1)
         # correctly produce values for this new row based on the actual history.
-        last_date_val = data.iloc[-1]['date']
-        next_date = last_date_val + pd.Timedelta(days=7)
+        next_date = self.infer_next_draw_date(data)
 
         dummy_row = pd.DataFrame([{
             'date': next_date,
@@ -582,4 +605,3 @@ class LotteryDataManager:
         logger.debug(f"Feature vector size for next draw: {len(feature_vector)}")
         
         return feature_vector
-
