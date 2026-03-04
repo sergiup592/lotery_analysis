@@ -21,24 +21,35 @@ for directory in [MODELS_DIR, LOGS_DIR, PREDICTIONS_DIR]:
 # Model Configuration
 NEURAL_MODEL_PARAMS = {
     "sequence_length": 20,
-    "batch_size": 64,
-    "epochs": 300,
+    "batch_size": 32,
+    "epochs": 180,
     "learning_rate": 0.0005
 }
 
 # Transformer architecture scaling
 NEURAL_ARCH_CONFIG = {
-    "d_model": 512,          # base hidden size (aggressive)
-    "num_layers": 16,        # transformer encoder layers (aggressive)
-    "num_heads": 16,         # attention heads (aggressive)
-    "ff_multiplier": 4.0,    # feed-forward expansion
+    "d_model": 256,          # balanced capacity for this dataset size
+    "num_layers": 8,         # deep enough without excessive overfitting risk
+    "num_heads": 8,          # used with per-head key_dim in neural model
+    "ff_multiplier": 3.0,    # feed-forward expansion
     "dropout": 0.15,         # dropout inside blocks
     "label_smoothing": 0.05  # helps calibration and reduces overconfidence
 }
 
 STATISTICAL_CONFIG = {
     "recent_window": 100,
-    "hot_cold_window": 50
+    "hot_cold_window": 50,
+    "frequency_weight": 0.6,
+    "recency_weight": 0.4,
+    "elite_candidates": 12,
+    "elite_main_step": 3,
+    "elite_bonus_step": 1,
+    "pattern_window": 240,
+    "pair_window": 300,
+    "main_top_pool": 16,
+    "bonus_top_pool": 8,
+    "main_diversity_penalty": 0.08,
+    "bonus_diversity_penalty": 0.04,
 }
 
 PPO_PARAMS = {
@@ -48,7 +59,7 @@ PPO_PARAMS = {
     "lam": 0.95,
     "entropy_coef": 0.05,    # Increased from 0.02 for better exploration
     "batch_size": 32,
-    "epochs": 200
+    "epochs": 80
 }
 
 # Sampling configuration (used for all model samplers)

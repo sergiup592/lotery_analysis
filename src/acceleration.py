@@ -8,6 +8,29 @@ _TF_CONFIGURED = False
 _XGB_DEVICE_PARAMS = None
 
 
+def _xgboost_cuda_compiled(xgb_module) -> bool:
+    """Best-effort check whether XGBoost was built with CUDA support."""
+    try:
+        build_info_fn = getattr(xgb_module, "build_info", None)
+        if callable(build_info_fn):
+            build_info = build_info_fn()
+            if isinstance(build_info, dict) and "USE_CUDA" in build_info:
+                use_cuda = build_info.get("USE_CUDA")
+                if isinstance(use_cuda, str):
+                    return use_cuda.strip().lower() in {"1", "true", "yes", "on"}
+                return bool(use_cuda)
+    except Exception:
+        pass
+
+    has_cuda_fn = getattr(xgb_module.core, "_has_cuda_support", None)
+    if callable(has_cuda_fn):
+        try:
+            return bool(has_cuda_fn())
+        except Exception:
+            return False
+    return False
+
+
 def configure_tensorflow() -> bool:
     """Configure TensorFlow to use GPU if available."""
     global _TF_CONFIGURED
@@ -72,44 +95,22 @@ def get_xgboost_device_params() -> Dict[str, str]:
         return dict(_XGB_DEVICE_PARAMS)
 
     try:
-        import numpy as np
         import xgboost as xgb
     except Exception as exc:
         _XGB_DEVICE_PARAMS = {"tree_method": "hist"}
         logger.info("XGBoost import failed; using CPU: %s", exc)
         return dict(_XGB_DEVICE_PARAMS)
 
-    if os.environ.get("XGBOOST_FORCE_GPU") == "1":
-        _XGB_DEVICE_PARAMS = {"tree_method": "gpu_hist", "predictor": "gpu_predictor"}
-        logger.info("XGBoost forced to GPU via XGBOOST_FORCE_GPU.")
+    force_gpu = os.environ.get("XGBOOST_FORCE_GPU") == "1"
+    cuda_compiled = _xgboost_cuda_compiled(xgb)
+
+    if force_gpu and not cuda_compiled:
+        logger.warning("XGBOOST_FORCE_GPU is set but this XGBoost build has no CUDA support; using CPU.")
+
+    if force_gpu or cuda_compiled:
+        _XGB_DEVICE_PARAMS = {"tree_method": "hist", "device": "cuda"}
+        logger.info("XGBoost GPU enabled.")
         return dict(_XGB_DEVICE_PARAMS)
 
-    use_gpu = True
-    has_cuda = getattr(xgb.core, "_has_cuda_support", None)
-    try:
-        if callable(has_cuda) and not has_cuda():
-            use_gpu = False
-    except Exception:
-        pass
-
-    if use_gpu:
-        try:
-            rng = np.random.default_rng(42)
-            X = rng.normal(size=(8, 4))
-            y = rng.integers(0, 2, size=8)
-            probe = xgb.XGBClassifier(
-                n_estimators=1,
-                max_depth=2,
-                tree_method="gpu_hist",
-                predictor="gpu_predictor",
-                verbosity=0,
-            )
-            probe.fit(X, y)
-            _XGB_DEVICE_PARAMS = {"tree_method": "gpu_hist", "predictor": "gpu_predictor"}
-            logger.info("XGBoost GPU enabled.")
-            return dict(_XGB_DEVICE_PARAMS)
-        except Exception as exc:
-            logger.info("XGBoost GPU not available; using CPU: %s", exc)
-
-    _XGB_DEVICE_PARAMS = {"tree_method": "hist"}
+    _XGB_DEVICE_PARAMS = {"tree_method": "hist", "device": "cpu"}
     return dict(_XGB_DEVICE_PARAMS)

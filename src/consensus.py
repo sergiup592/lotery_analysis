@@ -1,6 +1,6 @@
 import numpy as np
 import logging
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from .config import N_MAIN, N_BONUS, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE, SAMPLING_CONFIG
 from .filters import StatisticalFilter
 
@@ -16,105 +16,294 @@ class ConsensusEngine:
             'RandomForest': 0.20,
             'Statistical': 0.10,
             'ExtraTrees': 0.15,
-            'Ensemble': 0.12             # Added Ensemble source
+            'Ensemble': 0.08             # Keep ensemble meaningful but not dominant
         }
         self.filter = StatisticalFilter()
         # Adaptive weighting parameters
         self.confidence_weight_factor = 1.5  # How much to boost weights based on confidence
         self.diversity_penalty_base = 0.15   # Reduced from 0.2 for less aggressive penalty
+        self.min_dynamic_source_weight = 0.05
+        self.max_dynamic_source_weight = 0.30
+        self.max_dynamic_weight_by_source = {
+            "Ensemble": 0.22
+        }
+        self.invalid_filter_penalty = 0.65
+        self.performance_weight_factor = 0.40
+        self.performance_min_samples = 6
+        self.source_repeat_penalty = 0.12
+        self.consensus_support_factor = 0.14
+        self.coverage_gain_weight = 0.20
+        self.selection_support_weight = 0.10
+        self.random_main_hit_baseline = (N_MAIN * N_MAIN) / float(MAIN_NUMBER_RANGE)
+        self.source_main_hits = {}
+        self.source_sample_counts = {}
         self.sampling = SAMPLING_CONFIG
-        
+        self._tuning_param_bounds = {
+            "confidence_weight_factor": (0.1, 3.0),
+            "diversity_penalty_base": (0.02, 0.40),
+            "invalid_filter_penalty": (0.30, 1.00),
+            "performance_weight_factor": (0.05, 0.80),
+            "source_repeat_penalty": (0.02, 0.30),
+            "consensus_support_factor": (0.00, 0.40),
+            "coverage_gain_weight": (0.00, 0.50),
+            "selection_support_weight": (0.00, 0.30),
+        }
+
+    @staticmethod
+    def tuning_profiles() -> Dict[str, Dict[str, float]]:
+        """Named consensus tuning profiles used by prequential auto-tuning."""
+        return {
+            "balanced": {
+                "confidence_weight_factor": 1.50,
+                "diversity_penalty_base": 0.15,
+                "invalid_filter_penalty": 0.65,
+                "performance_weight_factor": 0.40,
+                "source_repeat_penalty": 0.12,
+                "consensus_support_factor": 0.14,
+                "coverage_gain_weight": 0.20,
+                "selection_support_weight": 0.10,
+            },
+            "precision": {
+                "confidence_weight_factor": 1.95,
+                "diversity_penalty_base": 0.10,
+                "invalid_filter_penalty": 0.72,
+                "performance_weight_factor": 0.48,
+                "source_repeat_penalty": 0.08,
+                "consensus_support_factor": 0.18,
+                "coverage_gain_weight": 0.12,
+                "selection_support_weight": 0.14,
+            },
+            "diversity": {
+                "confidence_weight_factor": 1.10,
+                "diversity_penalty_base": 0.24,
+                "invalid_filter_penalty": 0.60,
+                "performance_weight_factor": 0.35,
+                "source_repeat_penalty": 0.18,
+                "consensus_support_factor": 0.10,
+                "coverage_gain_weight": 0.28,
+                "selection_support_weight": 0.06,
+            },
+            "agreement": {
+                "confidence_weight_factor": 1.45,
+                "diversity_penalty_base": 0.13,
+                "invalid_filter_penalty": 0.68,
+                "performance_weight_factor": 0.44,
+                "source_repeat_penalty": 0.10,
+                "consensus_support_factor": 0.24,
+                "coverage_gain_weight": 0.18,
+                "selection_support_weight": 0.16,
+            },
+        }
+
+    def get_tuning_profile(self) -> Dict[str, float]:
+        """Return current tunable consensus parameters."""
+        return {
+            "confidence_weight_factor": float(self.confidence_weight_factor),
+            "diversity_penalty_base": float(self.diversity_penalty_base),
+            "invalid_filter_penalty": float(self.invalid_filter_penalty),
+            "performance_weight_factor": float(self.performance_weight_factor),
+            "source_repeat_penalty": float(self.source_repeat_penalty),
+            "consensus_support_factor": float(self.consensus_support_factor),
+            "coverage_gain_weight": float(self.coverage_gain_weight),
+            "selection_support_weight": float(self.selection_support_weight),
+        }
+
+    def set_tuning_profile(self, profile: Optional[Dict[str, Any]]) -> None:
+        """Apply tunable consensus parameters with bounds clamping."""
+        if not profile:
+            return
+        for key, value in profile.items():
+            if key not in self._tuning_param_bounds:
+                continue
+            lo, hi = self._tuning_param_bounds[key]
+            try:
+                numeric = float(value)
+            except Exception:
+                continue
+            setattr(self, key, float(np.clip(numeric, lo, hi)))
+
+    def fit_filters(self, historical_data) -> None:
+        """Fit hard-filter thresholds using historical draws."""
+        try:
+            self.filter.fit(historical_data)
+        except Exception as exc:
+            logger.warning("Failed to fit statistical filters from history: %s", exc)
+
+    def set_source_performance(self, source_main_hits: Dict[str, float], source_sample_counts: Dict[str, int]) -> None:
+        """
+        Set historical per-source performance for dynamic weighting.
+        Values should come from strictly past draws to avoid leakage.
+        """
+        self.source_main_hits = dict(source_main_hits or {})
+        self.source_sample_counts = dict(source_sample_counts or {})
+
     def rank_predictions(self, predictions: List[Dict]) -> List[Dict]:
-        """Rank predictions using Diversity (Round-Robin) and Filtering."""
+        """Rank predictions using weighted global ranking and filtering."""
         
         # 1. Group by Source
         grouped_preds = {}
         for pred in predictions:
-            s = pred['source']
+            normalized = self._normalize_prediction(pred)
+            if normalized is None:
+                continue
+            s = normalized['source']
             if s not in grouped_preds:
                 grouped_preds[s] = []
-            grouped_preds[s].append(pred)
+            grouped_preds[s].append(normalized)
             
         # 2. Filter and Sort each group internally
         valid_grouped_preds = {}
         source_conf = {}
         for source, preds in grouped_preds.items():
-            valid_preds = []
+            # Keep only the strongest candidate for duplicate combinations within a source.
+            deduped = {}
             for p in preds:
-                # Apply Hard Filters
+                combo_key = tuple(p["main_numbers"] + p["bonus_numbers"])
+                prev = deduped.get(combo_key)
+                if prev is None or float(p.get("confidence", 0.0)) > float(prev.get("confidence", 0.0)):
+                    deduped[combo_key] = p
+
+            valid_preds = []
+            for p in deduped.values():
+                # Apply statistical filter as soft penalty (avoid over-pruning candidate pool).
                 is_valid, _ = self.filter.validate(p['main_numbers'])
-                if not is_valid:
-                    continue
+                filter_penalty = 1.0 if is_valid else self.invalid_filter_penalty
                 
                 # IMPORTANT: Create a copy to avoid mutating the original prediction dict
                 p_copy = p.copy()
                 
                 # Apply Soft Validation Rules (Score Adjustment)
-                weight = self.base_weights.get(p_copy['source'], 0.1)
-                base_score = p_copy['confidence'] * weight
+                base_score = float(p_copy.get('confidence', 0.0))
                 density_boost = self._expected_hit_boost(p_copy)
-                final_score = self._apply_validation_rules(p_copy, base_score * density_boost)
+                final_score = self._apply_validation_rules(p_copy, base_score * density_boost) * filter_penalty
                 p_copy['final_score'] = final_score
-                valid_preds.append(p_copy)
-                source_conf.setdefault(source, []).append(p_copy['confidence'])
+                if p_copy['final_score'] > 0:
+                    valid_preds.append(p_copy)
+                    source_conf.setdefault(source, []).append(float(p_copy.get('confidence', 0.0)))
             
             # Sort by score descending
             valid_preds.sort(key=lambda x: x['final_score'], reverse=True)
             valid_grouped_preds[source] = valid_preds
 
+        # Keep only sources that have at least one valid candidate.
+        present_sources = [s for s, preds in valid_grouped_preds.items() if preds]
+        if not present_sources:
+            return []
+
         # Dynamic weighting: adaptively scale weights based on model confidence and performance
         dynamic_weights = {}
-        for src, base_w in self.base_weights.items():
+        for src in present_sources:
+            base_w = self.base_weights.get(src, 0.1)
             if src in source_conf and source_conf[src]:
                 avg_conf = max(1e-3, float(np.mean(source_conf[src])))
                 std_conf = float(np.std(source_conf[src])) if len(source_conf[src]) > 1 else 0.0
 
                 # Boost weight for high confidence and consistency (low std)
-                confidence_boost = 1.0 + (avg_conf * self.confidence_weight_factor)
-                consistency_boost = 1.0 + (0.1 / (std_conf + 0.1))  # Low std = high consistency
+                confidence_boost = 1.0 + (min(avg_conf, 0.6) * self.confidence_weight_factor)
+                consistency_boost = 1.0 + min(0.4, (0.1 / (std_conf + 0.1)))  # Low std = high consistency
+                performance_multiplier = self._performance_multiplier(src)
 
-                dynamic_weights[src] = base_w * confidence_boost * consistency_boost
+                dynamic_weights[src] = base_w * confidence_boost * consistency_boost * performance_multiplier
             else:
-                dynamic_weights[src] = base_w
+                dynamic_weights[src] = base_w * self._performance_multiplier(src)
 
         # Normalize weights to sum to 1
         total_w = sum(dynamic_weights.values()) or 1.0
         for k in dynamic_weights:
             dynamic_weights[k] /= total_w
 
+        # Avoid any single source dominating rank order (important when one model is overconfident).
+        for k in dynamic_weights:
+            max_w = self.max_dynamic_weight_by_source.get(k, self.max_dynamic_source_weight)
+            dynamic_weights[k] = float(
+                np.clip(dynamic_weights[k], self.min_dynamic_source_weight, max_w)
+            )
+        clipped_total = sum(dynamic_weights.values()) or 1.0
+        for k in dynamic_weights:
+            dynamic_weights[k] /= clipped_total
+
+        for source, preds in valid_grouped_preds.items():
+            source_weight = dynamic_weights.get(source, self.base_weights.get(source, 0.1))
+            for pred in preds:
+                pred['final_score'] *= source_weight
+            preds.sort(key=lambda x: x['final_score'], reverse=True)
+
         logger.info(f"Adaptive model weights: {dynamic_weights}")
-        
-        # 3. Round-Robin Selection
-        # We want to pick: 1st from Source A, 1st from Source B, ..., 2nd from Source A...
-        # Order sources by weight? Or just cycle through them?
-        # Let's cycle through them in order of weight (Neural -> XGB -> RF -> Stat)
-        
-        sorted_sources = sorted(dynamic_weights.keys(), key=lambda k: dynamic_weights[k], reverse=True)
-        
+
+        # 3. Global ranking across all sources (choose_diverse_top applies final diversity selection)
+        all_valid = []
+        for preds in valid_grouped_preds.values():
+            all_valid.extend(preds)
+        # Merge duplicates across sources and reward cross-source agreement.
+        combo_aggregate = {}
+        for pred in all_valid:
+            combo_key = tuple(sorted(pred["main_numbers"]) + sorted(pred["bonus_numbers"]))
+            source = pred.get("source", "Unknown")
+            score = float(pred.get("final_score", 0.0))
+
+            entry = combo_aggregate.get(combo_key)
+            if entry is None:
+                combo_aggregate[combo_key] = {
+                    "score_sum": score,
+                    "best_score": score,
+                    "best_pred": pred.copy(),
+                    "sources": {source},
+                }
+                continue
+
+            entry["score_sum"] += score
+            entry["sources"].add(source)
+            if score > entry["best_score"]:
+                entry["best_score"] = score
+                entry["best_pred"] = pred.copy()
+
         final_ranked = []
-        seen_combinations = set()
-        
-        # Find max length to iterate
-        max_len = max([len(p) for p in valid_grouped_preds.values()] + [0])
-        
-        for i in range(max_len):
-            for source in sorted_sources:
-                if source in valid_grouped_preds and i < len(valid_grouped_preds[source]):
-                    pred = valid_grouped_preds[source][i]
+        for entry in combo_aggregate.values():
+            merged_pred = entry["best_pred"].copy()
+            support_count = max(1, len(entry["sources"]))
+            support_bonus = 1.0 + (self.consensus_support_factor * (support_count - 1))
+            merged_pred["support_count"] = support_count
+            merged_pred["support_sources"] = sorted(entry["sources"])
+            merged_pred["final_score"] = float(entry["score_sum"] * support_bonus)
+            final_ranked.append(merged_pred)
 
-                    # Check uniqueness (exact)
-                    combo_key = tuple(sorted(pred['main_numbers']) + sorted(pred['bonus_numbers']))
-                    if combo_key in seen_combinations:
-                        continue
+        final_ranked.sort(key=lambda x: x["final_score"], reverse=True)
 
-                    # Diversity penalty against already selected combos to avoid near-duplicates
-                    diversity_factor = self._diversity_factor(pred, final_ranked)
-                    pred['final_score'] *= diversity_factor
-
-                    seen_combinations.add(combo_key)
-                    final_ranked.append(pred)
-                    
         return final_ranked
+
+    def _normalize_prediction(self, pred: Dict) -> Optional[Dict]:
+        """Validate and normalize a candidate prediction before ranking."""
+        if not isinstance(pred, dict):
+            return None
+
+        main_numbers = pred.get("main_numbers")
+        bonus_numbers = pred.get("bonus_numbers")
+        source = pred.get("source", "Unknown")
+
+        if not isinstance(main_numbers, (list, tuple)) or not isinstance(bonus_numbers, (list, tuple)):
+            return None
+
+        try:
+            main_nums = sorted(int(n) for n in main_numbers)
+            bonus_nums = sorted(int(n) for n in bonus_numbers)
+        except Exception:
+            return None
+
+        if len(main_nums) != N_MAIN or len(bonus_nums) != N_BONUS:
+            return None
+        if len(set(main_nums)) != N_MAIN or len(set(bonus_nums)) != N_BONUS:
+            return None
+        if any(n < 1 or n > MAIN_NUMBER_RANGE for n in main_nums):
+            return None
+        if any(n < 1 or n > BONUS_NUMBER_RANGE for n in bonus_nums):
+            return None
+
+        out = pred.copy()
+        out["source"] = str(source)
+        out["main_numbers"] = main_nums
+        out["bonus_numbers"] = bonus_nums
+        out["confidence"] = float(max(0.0, out.get("confidence", 0.0)))
+        return out
 
     def choose_diverse_top(self, ranked_preds: List[Dict], k: int) -> List[Dict]:
         """
@@ -123,6 +312,7 @@ class ConsensusEngine:
         chosen = []
         seen = set()
         candidates = list(ranked_preds)
+        multi_source_mode = len({p.get("source") for p in candidates}) > 1
 
         while candidates and len(chosen) < k:
             best = None
@@ -134,7 +324,15 @@ class ConsensusEngine:
                     continue
 
                 diversity = self._diversity_factor(pred, chosen)
-                score = pred['final_score'] * diversity
+                source_diversity = self._source_diversity_factor(pred, chosen)
+                support_multiplier = 1.0
+                coverage_multiplier = 1.0
+                if multi_source_mode:
+                    support_count = int(pred.get("support_count", 1))
+                    support_multiplier = 1.0 + (self.selection_support_weight * max(0, support_count - 1))
+                    coverage_gain = self._marginal_coverage_gain(pred, chosen)
+                    coverage_multiplier = 1.0 + (self.coverage_gain_weight * coverage_gain)
+                score = pred['final_score'] * diversity * source_diversity * support_multiplier * coverage_multiplier
                 if score > best_score:
                     best = pred
                     best_score = score
@@ -150,6 +348,83 @@ class ConsensusEngine:
             candidates.pop(best_idx)
 
         return chosen
+
+    def _performance_multiplier(self, source: str) -> float:
+        """Convert source hit history into a bounded multiplicative weight."""
+        if source not in self.source_main_hits:
+            return 1.0
+
+        avg_hits = float(self.source_main_hits[source])
+        sample_count = int(self.source_sample_counts.get(source, 0))
+        reliability = min(1.0, sample_count / float(max(1, self.performance_min_samples)))
+
+        # Relative edge vs random expectation (5 hits drawn from 50 -> expected 0.5 overlaps).
+        edge = (avg_hits - self.random_main_hit_baseline) / max(0.2, self.random_main_hit_baseline)
+        edge = float(np.clip(edge, -0.8, 1.0))
+
+        multiplier = 1.0 + (self.performance_weight_factor * edge * reliability)
+        return float(np.clip(multiplier, 0.65, 1.40))
+
+    def _source_diversity_factor(self, pred: Dict, selected: List[Dict]) -> float:
+        """
+        Mildly penalize reusing the same source in top-k picks.
+        This improves model-family coverage when top scores are near-ties.
+        """
+        if not selected:
+            return 1.0
+        source = pred.get("source")
+        repeats = sum(1 for s in selected if s.get("source") == source)
+        if repeats <= 0:
+            return 1.0
+        return max(0.7, 1.0 - (self.source_repeat_penalty * repeats))
+
+    def _marginal_coverage_gain(self, pred: Dict, selected: List[Dict]) -> float:
+        """
+        Estimate marginal coverage gain for this candidate relative to already selected picks.
+        Uses candidate probability mass so gains prioritize uncovered high-likelihood numbers.
+        Returns a bounded [0, 1] value.
+        """
+        if not selected:
+            return 0.0
+
+        covered_main = set()
+        covered_bonus = set()
+        for existing in selected:
+            covered_main.update(existing.get("main_numbers", []))
+            covered_bonus.update(existing.get("bonus_numbers", []))
+
+        main_gain = 0.0
+        main_vec = pred.get("main_prob_vector")
+        if main_vec is not None:
+            try:
+                probs = np.asarray(main_vec, dtype=float)
+                idx = np.asarray(pred["main_numbers"], dtype=int) - 1
+                chosen_mass = float(np.sum(probs[idx]))
+                if chosen_mass > 0:
+                    uncovered = [n for n in pred["main_numbers"] if n not in covered_main]
+                    if uncovered:
+                        unc_idx = np.asarray(uncovered, dtype=int) - 1
+                        main_gain = float(np.sum(probs[unc_idx]) / chosen_mass)
+            except Exception:
+                main_gain = 0.0
+
+        bonus_gain = 0.0
+        bonus_vec = pred.get("bonus_prob_vector")
+        if bonus_vec is not None:
+            try:
+                probs = np.asarray(bonus_vec, dtype=float)
+                idx = np.asarray(pred["bonus_numbers"], dtype=int) - 1
+                chosen_mass = float(np.sum(probs[idx]))
+                if chosen_mass > 0:
+                    uncovered = [n for n in pred["bonus_numbers"] if n not in covered_bonus]
+                    if uncovered:
+                        unc_idx = np.asarray(uncovered, dtype=int) - 1
+                        bonus_gain = float(np.sum(probs[unc_idx]) / chosen_mass)
+            except Exception:
+                bonus_gain = 0.0
+
+        gain = (0.65 * main_gain) + (0.35 * bonus_gain)
+        return float(np.clip(gain, 0.0, 1.0))
 
     def _expected_hit_boost(self, pred: Dict) -> float:
         """
@@ -175,7 +450,7 @@ class ConsensusEngine:
         # Fall back to vectors ONLY if precomputed values not available
         if not main_prob_added:
             main_vec = pred.get('main_prob_vector')
-            if main_vec:
+            if main_vec is not None and len(main_vec) > 0:
                 try:
                     main_probs = np.array(main_vec, dtype=float)
                     boost += float(np.sum(main_probs[np.array(pred['main_numbers']) - 1]))
@@ -184,7 +459,7 @@ class ConsensusEngine:
 
         if not bonus_prob_added:
             bonus_vec = pred.get('bonus_prob_vector')
-            if bonus_vec:
+            if bonus_vec is not None and len(bonus_vec) > 0:
                 try:
                     bonus_probs = np.array(bonus_vec, dtype=float)
                     boost += float(0.5 * np.sum(bonus_probs[np.array(pred['bonus_numbers']) - 1]))
@@ -327,12 +602,12 @@ class ConsensusEngine:
         total_bonus_weight = 0.0
 
         for source, avg_probs in avg_main_by_source.items():
-            weight = self.base_weights.get(source, 0.1)
+            weight = self.base_weights.get(source, 0.1) * self._performance_multiplier(source)
             ensemble_main += weight * avg_probs
             total_main_weight += weight
 
         for source, avg_probs in avg_bonus_by_source.items():
-            weight = self.base_weights.get(source, 0.1)
+            weight = self.base_weights.get(source, 0.1) * self._performance_multiplier(source)
             ensemble_bonus += weight * avg_probs
             total_bonus_weight += weight
 

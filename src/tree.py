@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 import logging
-from typing import List, Dict, Tuple
+from typing import Any, List, Dict, Tuple
 from .config import N_MAIN, N_BONUS, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE, SAMPLING_CONFIG
 from .data import LotteryDataManager
 
@@ -10,53 +10,110 @@ logger = logging.getLogger(__name__)
 
 class RandomForestModel:
     """Random Forest Model for Lottery Prediction."""
-    
-    def __init__(self):
+
+    source_name = "RandomForest"
+    model_name = "Random Forest"
+
+    def __init__(self, training_profile: str = "default"):
         self.main_model = None
         self.bonus_model = None
         self.is_trained = False
         self.sampling = SAMPLING_CONFIG
-        
+        self.training_profile = training_profile
+
+    def _estimator_class(self):
+        return RandomForestClassifier
+
+    def _profile_map(self) -> Dict[str, Dict[str, Dict[str, int]]]:
+        return {
+            "default": {
+                "main": {
+                    "n_estimators": 800,
+                    "max_depth": 22,
+                    "min_samples_split": 3,
+                    "min_samples_leaf": 1,
+                },
+                "bonus": {
+                    "n_estimators": 600,
+                    "max_depth": 16,
+                    "min_samples_split": 3,
+                    "min_samples_leaf": 1,
+                },
+            },
+            "fast": {
+                "main": {
+                    "n_estimators": 220,
+                    "max_depth": 14,
+                    "min_samples_split": 4,
+                    "min_samples_leaf": 2,
+                },
+                "bonus": {
+                    "n_estimators": 160,
+                    "max_depth": 11,
+                    "min_samples_split": 4,
+                    "min_samples_leaf": 2,
+                },
+            },
+            "ultrafast": {
+                "main": {
+                    "n_estimators": 110,
+                    "max_depth": 10,
+                    "min_samples_split": 6,
+                    "min_samples_leaf": 2,
+                },
+                "bonus": {
+                    "n_estimators": 80,
+                    "max_depth": 8,
+                    "min_samples_split": 6,
+                    "min_samples_leaf": 2,
+                },
+            },
+        }
+
+    def _resolve_training_params(self, output_kind: str) -> Dict[str, Any]:
+        profile_map = self._profile_map()
+        profile = self.training_profile if self.training_profile in profile_map else "default"
+        if profile != self.training_profile:
+            logger.warning(
+                "Unknown %s training profile '%s'; falling back to 'default'.",
+                self.model_name,
+                self.training_profile,
+            )
+        return profile_map[profile][output_kind]
+
     def train(self, data: pd.DataFrame):
         """Train the Random Forest models."""
-        logger.info("Training Random Forest Model...")
+        logger.info("Training %s Model (profile=%s)...", self.model_name, self.training_profile)
         
         # Prepare features and targets
         X, y_main, y_bonus = self._prepare_data(data)
         if len(X) == 0:
-            raise ValueError("Not enough data to train RandomForestModel.")
+            raise ValueError(f"Not enough data to train {self.__class__.__name__}.")
         
-        # Initialize models
-        # We use MultiOutputClassifier to handle multiple outputs (one for each number in the range)
-        # Alternatively, we can treat it as a multi-label problem.
-        # Here we predict probability for EACH number being in the draw.
-        
+        est_cls = self._estimator_class()
+        main_params = self._resolve_training_params("main")
+        bonus_params = self._resolve_training_params("bonus")
+
         # Main Numbers Model
-        self.main_model = RandomForestClassifier(
-            n_estimators=800,
-            max_depth=22,
-            min_samples_split=3,
-            min_samples_leaf=1,
+        self.main_model = est_cls(
             class_weight="balanced_subsample",
             random_state=42,
-            n_jobs=-1
+            n_jobs=-1,
+            **main_params,
         )
         self.main_model.fit(X, y_main)
         
         # Bonus Numbers Model
-        self.bonus_model = RandomForestClassifier(
-            n_estimators=600,
-            max_depth=16,
-            min_samples_split=3,
-            min_samples_leaf=1,
+        self.bonus_model = est_cls(
             class_weight="balanced_subsample",
             random_state=42,
-            n_jobs=-1
+            n_jobs=-1,
+            **bonus_params,
         )
         self.bonus_model.fit(X, y_bonus)
         
         self.is_trained = True
-        logger.info("Random Forest training complete.")
+        logger.info("%s training complete.", self.model_name)
 
     def _apply_sampling_bias(self, probs: np.ndarray, top_k: int, temperature: float,
                                top_p: float = None, required_nonzero: int = None) -> np.ndarray:
@@ -159,7 +216,12 @@ class RandomForestModel:
         bonus_prob_vector = bonus_probs.copy()
         
         predictions = []
-        for _ in range(num_predictions):
+        seen_combinations = set()
+        max_attempts = max(num_predictions * 12, 80)
+        attempts = 0
+
+        while len(predictions) < num_predictions and attempts < max_attempts:
+            attempts += 1
             # Sample Main
             main_nums = np.random.choice(
                 np.arange(1, MAIN_NUMBER_RANGE + 1),
@@ -175,6 +237,11 @@ class RandomForestModel:
                 replace=False,
                 p=bonus_probs
             )
+
+            combo_key = tuple(sorted(main_nums.tolist()) + sorted(bonus_nums.tolist()))
+            if combo_key in seen_combinations:
+                continue
+            seen_combinations.add(combo_key)
             
             # Confidence
             main_conf = np.mean([main_probs[n-1] for n in main_nums])
@@ -188,8 +255,17 @@ class RandomForestModel:
                 'bonus_prob_vector': bonus_prob_vector.tolist(),
                 'expected_main_prob': float(np.sum(main_prob_vector[main_nums-1])),
                 'expected_bonus_prob': float(np.sum(bonus_prob_vector[bonus_nums-1])),
-                'source': 'RandomForest'
+                'source': self.source_name
             })
+
+        if len(predictions) < num_predictions:
+            logger.debug(
+                "%s generated %d/%d unique predictions after %d attempts.",
+                self.model_name,
+                len(predictions),
+                num_predictions,
+                attempts,
+            )
             
         return predictions
 
@@ -275,37 +351,54 @@ class RandomForestModel:
 class ExtraTreesModel(RandomForestModel):
     """Extra Trees Model for Lottery Prediction (more randomized splits)."""
 
-    def train(self, data: pd.DataFrame):
-        """Train the Extra Trees models."""
-        logger.info("Training Extra Trees Model...")
+    source_name = "ExtraTrees"
+    model_name = "Extra Trees"
 
-        X, y_main, y_bonus = self._prepare_data(data)
-        if len(X) == 0:
-            raise ValueError("Not enough data to train ExtraTreesModel.")
+    def _estimator_class(self):
+        return ExtraTreesClassifier
 
-        # Main Numbers Model
-        self.main_model = ExtraTreesClassifier(
-            n_estimators=1200,
-            max_depth=24,
-            min_samples_split=3,
-            min_samples_leaf=1,
-            class_weight="balanced_subsample",
-            random_state=42,
-            n_jobs=-1
-        )
-        self.main_model.fit(X, y_main)
-
-        # Bonus Numbers Model
-        self.bonus_model = ExtraTreesClassifier(
-            n_estimators=800,
-            max_depth=18,
-            min_samples_split=3,
-            min_samples_leaf=1,
-            class_weight="balanced_subsample",
-            random_state=42,
-            n_jobs=-1
-        )
-        self.bonus_model.fit(X, y_bonus)
-
-        self.is_trained = True
-        logger.info("Extra Trees training complete.")
+    def _profile_map(self) -> Dict[str, Dict[str, Dict[str, int]]]:
+        return {
+            "default": {
+                "main": {
+                    "n_estimators": 1200,
+                    "max_depth": 24,
+                    "min_samples_split": 3,
+                    "min_samples_leaf": 1,
+                },
+                "bonus": {
+                    "n_estimators": 800,
+                    "max_depth": 18,
+                    "min_samples_split": 3,
+                    "min_samples_leaf": 1,
+                },
+            },
+            "fast": {
+                "main": {
+                    "n_estimators": 260,
+                    "max_depth": 15,
+                    "min_samples_split": 4,
+                    "min_samples_leaf": 2,
+                },
+                "bonus": {
+                    "n_estimators": 180,
+                    "max_depth": 12,
+                    "min_samples_split": 4,
+                    "min_samples_leaf": 2,
+                },
+            },
+            "ultrafast": {
+                "main": {
+                    "n_estimators": 130,
+                    "max_depth": 10,
+                    "min_samples_split": 6,
+                    "min_samples_leaf": 2,
+                },
+                "bonus": {
+                    "n_estimators": 90,
+                    "max_depth": 8,
+                    "min_samples_split": 6,
+                    "min_samples_leaf": 2,
+                },
+            },
+        }

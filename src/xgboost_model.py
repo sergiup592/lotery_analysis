@@ -9,10 +9,24 @@ from .acceleration import get_xgboost_device_params
 
 logger = logging.getLogger(__name__)
 
+
+class _ConstantProbabilityModel:
+    """Fallback binary model that returns a fixed P(class=1)."""
+
+    def __init__(self, p_one: float):
+        self.p_one = float(np.clip(p_one, 0.0, 1.0))
+        self.classes_ = np.array([0, 1], dtype=int)
+
+    def predict_proba(self, X):
+        n_rows = int(getattr(X, "shape", [len(X)])[0])
+        probs = np.array([[1.0 - self.p_one, self.p_one]], dtype=np.float64)
+        return np.repeat(probs, n_rows, axis=0)
+
+
 class XGBoostModel:
     """XGBoost Model for Lottery Prediction."""
     
-    def __init__(self):
+    def __init__(self, training_profile: str = "default"):
         self.main_models = [] # One model per number (binary classification) or one multi-output?
         # XGBoost doesn't natively support multi-label output in the same way as RF.
         # Standard approach: One binary classifier per number (One-vs-Rest).
@@ -22,37 +36,99 @@ class XGBoostModel:
         self.is_trained = False
         self.sampling = SAMPLING_CONFIG
         self.device_params = get_xgboost_device_params()
+        self.training_profile = training_profile
+
+    def _profile_map(self) -> Dict[str, Dict[str, float]]:
+        return {
+            "default": {
+                "main_n_estimators": 800,
+                "main_max_depth": 8,
+                "main_learning_rate": 0.03,
+                "main_subsample": 0.8,
+                "main_colsample_bytree": 0.8,
+                "bonus_n_estimators": 500,
+                "bonus_max_depth": 6,
+                "bonus_learning_rate": 0.03,
+                "bonus_subsample": 0.85,
+                "bonus_colsample_bytree": 0.9,
+            },
+            "fast": {
+                "main_n_estimators": 180,
+                "main_max_depth": 5,
+                "main_learning_rate": 0.07,
+                "main_subsample": 0.8,
+                "main_colsample_bytree": 0.8,
+                "bonus_n_estimators": 130,
+                "bonus_max_depth": 4,
+                "bonus_learning_rate": 0.07,
+                "bonus_subsample": 0.85,
+                "bonus_colsample_bytree": 0.9,
+            },
+            "ultrafast": {
+                "main_n_estimators": 80,
+                "main_max_depth": 4,
+                "main_learning_rate": 0.10,
+                "main_subsample": 0.8,
+                "main_colsample_bytree": 0.8,
+                "bonus_n_estimators": 60,
+                "bonus_max_depth": 3,
+                "bonus_learning_rate": 0.10,
+                "bonus_subsample": 0.85,
+                "bonus_colsample_bytree": 0.9,
+            },
+        }
         
     def train(self, data: pd.DataFrame):
         """Train the XGBoost models."""
-        logger.info("Training XGBoost Model...")
+        logger.info("Training XGBoost Model (profile=%s)...", self.training_profile)
         
         X, y_main, y_bonus = self._prepare_data(data)
         if len(X) == 0:
             raise ValueError("Not enough data to train XGBoostModel.")
 
+        profile_map = self._profile_map()
+        profile = self.training_profile if self.training_profile in profile_map else "default"
+        if profile != self.training_profile:
+            logger.warning(
+                "Unknown XGBoost training profile '%s'; falling back to 'default'.",
+                self.training_profile,
+            )
+        cfg = profile_map[profile]
+
         # Simple time-based split for early stopping (last 10% for validation)
         split_idx = max(1, int(len(X) * 0.9))
+        split_idx = min(split_idx, len(X))
         X_train, X_val = X[:split_idx], X[split_idx:]
         y_main_train, y_main_val = y_main[:split_idx], y_main[split_idx:]
         y_bonus_train, y_bonus_val = y_bonus[:split_idx], y_bonus[split_idx:]
+        has_validation = len(X_val) > 0
         
         # Train Main Number Models
         self.main_models = []
         for i in range(MAIN_NUMBER_RANGE):
             # Target: Did number i+1 appear?
             y = y_main_train[:, i]
+            if np.unique(y).size < 2:
+                prior = float(np.mean(y))
+                self.main_models.append(_ConstantProbabilityModel(prior))
+                logger.debug(
+                    "Main label %d has single class in train split; using constant prior %.4f.",
+                    i + 1,
+                    prior,
+                )
+                continue
+
             pos = float(np.sum(y))
             neg = float(len(y) - pos)
             scale_pos_weight = (neg / pos) if pos > 0 else 1.0
             scale_pos_weight = float(np.clip(scale_pos_weight, 1.0, 50.0))
             
             model = xgb.XGBClassifier(
-                n_estimators=800,
-                max_depth=8,
-                learning_rate=0.03,
-                subsample=0.8,
-                colsample_bytree=0.8,
+                n_estimators=int(cfg["main_n_estimators"]),
+                max_depth=int(cfg["main_max_depth"]),
+                learning_rate=float(cfg["main_learning_rate"]),
+                subsample=float(cfg["main_subsample"]),
+                colsample_bytree=float(cfg["main_colsample_bytree"]),
                 objective='binary:logistic',
                 scale_pos_weight=scale_pos_weight,
                 n_jobs=-1,
@@ -60,29 +136,37 @@ class XGBoostModel:
                 random_state=42,
                 **self.device_params
             )
-            model.fit(
-                X_train,
-                y,
-                eval_set=[(X_val, y_main_val[:, i])],
-                verbose=False
-            )
+            fit_kwargs = {"verbose": False}
+            if has_validation:
+                fit_kwargs["eval_set"] = [(X_val, y_main_val[:, i])]
+            model.fit(X_train, y, **fit_kwargs)
             self.main_models.append(model)
             
         # Train Bonus Number Models
         self.bonus_models = []
         for i in range(BONUS_NUMBER_RANGE):
             y = y_bonus_train[:, i]
+            if np.unique(y).size < 2:
+                prior = float(np.mean(y))
+                self.bonus_models.append(_ConstantProbabilityModel(prior))
+                logger.debug(
+                    "Bonus label %d has single class in train split; using constant prior %.4f.",
+                    i + 1,
+                    prior,
+                )
+                continue
+
             pos = float(np.sum(y))
             neg = float(len(y) - pos)
             scale_pos_weight = (neg / pos) if pos > 0 else 1.0
             scale_pos_weight = float(np.clip(scale_pos_weight, 1.0, 50.0))
             
             model = xgb.XGBClassifier(
-                n_estimators=500,
-                max_depth=6,
-                learning_rate=0.03,
-                subsample=0.85,
-                colsample_bytree=0.9,
+                n_estimators=int(cfg["bonus_n_estimators"]),
+                max_depth=int(cfg["bonus_max_depth"]),
+                learning_rate=float(cfg["bonus_learning_rate"]),
+                subsample=float(cfg["bonus_subsample"]),
+                colsample_bytree=float(cfg["bonus_colsample_bytree"]),
                 objective='binary:logistic',
                 scale_pos_weight=scale_pos_weight,
                 n_jobs=-1,
@@ -90,12 +174,10 @@ class XGBoostModel:
                 random_state=42,
                 **self.device_params
             )
-            model.fit(
-                X_train,
-                y,
-                eval_set=[(X_val, y_bonus_val[:, i])],
-                verbose=False
-            )
+            fit_kwargs = {"verbose": False}
+            if has_validation:
+                fit_kwargs["eval_set"] = [(X_val, y_bonus_val[:, i])]
+            model.fit(X_train, y, **fit_kwargs)
             self.bonus_models.append(model)
             
         self.is_trained = True
@@ -187,7 +269,12 @@ class XGBoostModel:
         bonus_prob_vector = bonus_probs.copy()
         
         predictions = []
-        for _ in range(num_predictions):
+        seen_combinations = set()
+        max_attempts = max(num_predictions * 12, 80)
+        attempts = 0
+
+        while len(predictions) < num_predictions and attempts < max_attempts:
+            attempts += 1
             # Sample Main
             main_nums = np.random.choice(
                 np.arange(1, MAIN_NUMBER_RANGE + 1),
@@ -203,6 +290,11 @@ class XGBoostModel:
                 replace=False,
                 p=bonus_probs
             )
+
+            combo_key = tuple(sorted(main_nums.tolist()) + sorted(bonus_nums.tolist()))
+            if combo_key in seen_combinations:
+                continue
+            seen_combinations.add(combo_key)
             
             # Confidence
             main_conf = np.mean([main_probs[n-1] for n in main_nums])
@@ -218,6 +310,14 @@ class XGBoostModel:
                 'expected_bonus_prob': float(np.sum(bonus_prob_vector[bonus_nums-1])),
                 'source': 'XGBoost'
             })
+
+        if len(predictions) < num_predictions:
+            logger.debug(
+                "XGBoost generated %d/%d unique predictions after %d attempts.",
+                len(predictions),
+                num_predictions,
+                attempts,
+            )
             
         return predictions
 

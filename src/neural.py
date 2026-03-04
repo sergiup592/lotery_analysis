@@ -36,8 +36,8 @@ class NeuralModel:
         self.arch = NEURAL_ARCH_CONFIG
         self.sampling = SAMPLING_CONFIG
         
-    def build_models(self):
-        """Build or load the neural network models."""
+    def build_models(self, load_existing: bool = True):
+        """Build new models or load existing ones when requested."""
         configure_tensorflow()
         main_model_path = MODELS_DIR / "main_transformer.keras"
         bonus_model_path = MODELS_DIR / "bonus_transformer.keras"
@@ -73,7 +73,7 @@ class NeuralModel:
             spread_dim
         )
 
-        if main_model_path.exists() and bonus_model_path.exists():
+        if load_existing and main_model_path.exists() and bonus_model_path.exists():
             try:
                 logger.info("Loading existing models...")
                 self.main_model = load_model(main_model_path)
@@ -102,6 +102,8 @@ class NeuralModel:
                 if self.bonus_model.input_shape[-1] != self.bonus_input_dim:
                     logger.warning(f"Bonus model input shape mismatch: {self.bonus_model.input_shape[-1]} vs {self.bonus_input_dim}. Rebuilding...")
                     raise ValueError("Shape mismatch")
+                self._validate_loaded_architecture(self.main_model, "main")
+                self._validate_loaded_architecture(self.bonus_model, "bonus")
 
                 # We also need critics for PPO, but we can rebuild them or load if saved
                 # For simplicity, we rebuild critics as they are for training only
@@ -134,8 +136,9 @@ class NeuralModel:
         """Create a Transformer Encoder model."""
         sequence_length = self.params['sequence_length']
         d_model = self.arch.get('d_model', 192)
-        num_layers = self.arch.get('num_layers', 6)
-        num_heads = self.arch.get('num_heads', 4)
+        num_layers = int(self.arch.get('num_layers', 6))
+        num_heads = max(1, int(self.arch.get('num_heads', 4)))
+        key_dim = max(8, d_model // num_heads)
         ff_mult = self.arch.get('ff_multiplier', 2.0)
         dropout_rate = self.arch.get('dropout', 0.0)
         label_smoothing = self.arch.get('label_smoothing', 0.0)
@@ -156,7 +159,11 @@ class NeuralModel:
         # Transformer Blocks
         for _ in range(num_layers): # deeper stack configurable for more capacity
             # Multi-Head Attention
-            attn_output = MultiHeadAttention(num_heads=num_heads, key_dim=d_model)(x, x)
+            attn_output = MultiHeadAttention(
+                num_heads=num_heads,
+                key_dim=key_dim,
+                dropout=dropout_rate,
+            )(x, x)
             attn_output = Dropout(dropout_rate)(attn_output)
             x = Add()([x, attn_output])
             x = LayerNormalization()(x)
@@ -186,6 +193,23 @@ class NeuralModel:
                      metrics=['accuracy'])
         return model
 
+    def _validate_loaded_architecture(self, model: Model, name: str) -> None:
+        expected_heads = max(1, int(self.arch.get('num_heads', 4)))
+        expected_key_dim = max(8, int(self.arch.get('d_model', 192)) // expected_heads)
+        attn_layers = [layer for layer in model.layers if isinstance(layer, MultiHeadAttention)]
+        if not attn_layers:
+            raise ValueError(f"{name} model has no MultiHeadAttention layers.")
+
+        for layer in attn_layers:
+            cfg = layer.get_config()
+            loaded_heads = int(cfg.get("num_heads", 0))
+            loaded_key_dim = int(cfg.get("key_dim", 0))
+            if loaded_heads != expected_heads or loaded_key_dim != expected_key_dim:
+                raise ValueError(
+                    f"{name} model attention mismatch (heads/key_dim): "
+                    f"{loaded_heads}/{loaded_key_dim} vs {expected_heads}/{expected_key_dim}"
+                )
+
     def _create_critic_model(self, input_dim: int, name: str) -> Model:
         """Create a Critic model (Value Function) for PPO."""
         # Similar architecture to Actor but outputs a single scalar (Value)
@@ -202,7 +226,7 @@ class NeuralModel:
         model.compile(optimizer=Adam(learning_rate=self.params['learning_rate']), loss='mse')
         return model
 
-    def train(self, data: pd.DataFrame):
+    def train(self, data: pd.DataFrame, save_models: bool = True):
         """Train the models using Supervised Learning."""
         logger.info("Preparing training data...")
         sequences, main_targets, bonus_targets = self._prepare_sequences(data)
@@ -220,7 +244,8 @@ class NeuralModel:
             ],
             verbose=1
         )
-        self.main_model.save(MODELS_DIR / "main_transformer.keras")
+        if save_models:
+            self.main_model.save(MODELS_DIR / "main_transformer.keras")
         
         # Train Bonus Model
         logger.info("Training Bonus Transformer...")
@@ -235,7 +260,8 @@ class NeuralModel:
             ],
             verbose=1
         )
-        self.bonus_model.save(MODELS_DIR / "bonus_transformer.keras")
+        if save_models:
+            self.bonus_model.save(MODELS_DIR / "bonus_transformer.keras")
         self.models_loaded = True
 
     def _prepare_sequences(self, data: pd.DataFrame) -> Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray, np.ndarray]:
@@ -318,7 +344,7 @@ class NeuralModel:
 
         return (np.array(sequences_main), np.array(sequences_bonus)), np.array(main_targets), np.array(bonus_targets)
 
-    def train_ppo(self, data: pd.DataFrame, epochs: int = None):
+    def train_ppo(self, data: pd.DataFrame, epochs: int = None, save_models: bool = True):
         """
         Fine-tune the model using Proximal Policy Optimization (PPO).
         """
@@ -520,19 +546,28 @@ class NeuralModel:
                     total_loss_bonus = actor_loss_bonus + 0.5 * critic_loss_bonus
                     
                 # Apply Gradients
-                grads_main = tape.gradient(total_loss_main, self.main_model.trainable_variables + self.main_critic.trainable_variables)
-                grads_bonus = tape.gradient(total_loss_bonus, self.bonus_model.trainable_variables + self.bonus_critic.trainable_variables)
-                
-                main_optimizer.apply_gradients(zip(grads_main, self.main_model.trainable_variables + self.main_critic.trainable_variables))
-                bonus_optimizer.apply_gradients(zip(grads_bonus, self.bonus_model.trainable_variables + self.bonus_critic.trainable_variables))
+                main_vars = self.main_model.trainable_variables + self.main_critic.trainable_variables
+                bonus_vars = self.bonus_model.trainable_variables + self.bonus_critic.trainable_variables
+                grads_main = tape.gradient(total_loss_main, main_vars)
+                grads_bonus = tape.gradient(total_loss_bonus, bonus_vars)
+
+                main_grad_pairs = [(g, v) for g, v in zip(grads_main, main_vars) if g is not None]
+                bonus_grad_pairs = [(g, v) for g, v in zip(grads_bonus, bonus_vars) if g is not None]
+
+                if main_grad_pairs:
+                    main_optimizer.apply_gradients(main_grad_pairs)
+                if bonus_grad_pairs:
+                    bonus_optimizer.apply_gradients(bonus_grad_pairs)
                 
                 total_reward += tf.reduce_sum(rewards)
                 
-            avg_reward = total_reward / (n_batches * batch_size)
+            avg_reward_tensor = total_reward / float(n_batches * batch_size)
+            avg_reward = float(avg_reward_tensor.numpy() if hasattr(avg_reward_tensor, "numpy") else avg_reward_tensor)
             logger.info(f"PPO Epoch {epoch+1}/{epochs} - Avg Reward: {avg_reward:.4f}")
             
-        self.main_model.save(MODELS_DIR / "main_transformer.keras")
-        self.bonus_model.save(MODELS_DIR / "bonus_transformer.keras")
+        if save_models:
+            self.main_model.save(MODELS_DIR / "main_transformer.keras")
+            self.bonus_model.save(MODELS_DIR / "bonus_transformer.keras")
         logger.info("PPO Fine-Tuning Complete.")
 
     def _apply_sampling_bias(self, probs: np.ndarray, top_k: int, temperature: float,
@@ -666,8 +701,12 @@ class NeuralModel:
         current_bonus_seq = bonus_features[-seq_len:].reshape(1, seq_len, -1)
         
         predictions = []
-        
-        for _ in range(num_predictions):
+        seen_combinations = set()
+        max_attempts = max(num_predictions * 15, 100)
+        attempts = 0
+
+        while len(predictions) < num_predictions and attempts < max_attempts:
+            attempts += 1
             # Predict Main
             main_probs_raw = self.main_model.predict(current_main_seq, verbose=0)[0]
             main_probs = self._apply_sampling_bias(
@@ -703,6 +742,11 @@ class NeuralModel:
                 replace=False,
                 p=bonus_probs
             )
+
+            combo_key = tuple(sorted(main_nums.tolist()) + sorted(bonus_nums.tolist()))
+            if combo_key in seen_combinations:
+                continue
+            seen_combinations.add(combo_key)
             
             main_conf = np.mean([main_probs[n-1] for n in main_nums])
             bonus_conf = np.mean([bonus_probs[n-1] for n in bonus_nums])
@@ -717,5 +761,13 @@ class NeuralModel:
                 'expected_bonus_prob': float(np.sum(bonus_prob_vector[bonus_nums-1])),
                 'source': 'Neural_Transformer'
             })
+
+        if len(predictions) < num_predictions:
+            logger.debug(
+                "Neural model generated %d/%d unique predictions after %d attempts.",
+                len(predictions),
+                num_predictions,
+                attempts,
+            )
             
         return predictions

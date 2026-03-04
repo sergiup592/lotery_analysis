@@ -3,13 +3,32 @@ import numpy as np
 import re
 from datetime import datetime
 import logging
-from typing import Tuple, List, Dict
-from .config import DATA_FILE, N_MAIN
+from typing import Optional, Tuple, List, Dict
+from .config import (
+    DATA_FILE,
+    N_MAIN,
+    N_BONUS,
+    MAIN_NUMBER_RANGE,
+    BONUS_NUMBER_RANGE,
+)
 
 logger = logging.getLogger(__name__)
 
 class LotteryDataManager:
     """Unified data manager for lottery analysis."""
+
+    _WEEKDAY_TOKENS = {
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    }
+    _DATE_ORDINAL_RE = re.compile(r"(\d+)(st|nd|rd|th)")
+    _JACKPOT_RE = re.compile(r"([€$£]?\d[\d,]*(?:\.\d+)?)")
+    _RESULT_RE = re.compile(r"\b(Roll|Won|-)\b", flags=re.IGNORECASE)
     
     def __init__(self, file_path: str = str(DATA_FILE)):
         self.file_path = file_path
@@ -21,50 +40,136 @@ class LotteryDataManager:
             return self.data
             
         try:
-            with open(self.file_path, 'r') as f:
-                content = f.read()
-                
-            # Regex to parse the specific format:
-            # "Tuesday\n4th March 2025 10 15 20 25 30 05 08 €100,000,000 Won"
-            # Handles newlines and variable spacing
-            draw_pattern = r"((?:\w+)\s+\d+(?:st|nd|rd|th)?\s+(?:\w+)\s+\d{4})\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(€[\d,]+)\s+(Roll|Won)"
-            
-            draws = re.findall(draw_pattern, content)
-            
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                raw_lines = [line.strip() for line in f if line.strip()]
+
+            draw_blocks = self._split_draw_blocks(raw_lines)
             parsed_data = []
-            for draw in draws:
-                date_str = draw[0].replace('\n', ' ')
-                # Remove ordinal suffixes (st, nd, rd, th) for easier parsing
-                date_str = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', date_str)
-                
-                try:
-                    date = datetime.strptime(date_str, "%A %d %B %Y")
-                except ValueError:
-                    # Fallback for manual parsing if needed
+            skipped_blocks = 0
+            for block in draw_blocks:
+                parsed_draw = self._parse_draw_block(block)
+                if parsed_draw is None:
+                    skipped_blocks += 1
                     continue
-                    
-                numbers = [int(x) for x in draw[1:8]]
-                main_numbers = numbers[:N_MAIN]
-                bonus_numbers = numbers[N_MAIN:]
-                
-                parsed_data.append({
-                    'date': date,
-                    'main_numbers': main_numbers,
-                    'bonus_numbers': bonus_numbers,
-                    'jackpot': draw[8],
-                    'result': draw[9]
-                })
-                
+                parsed_data.append(parsed_draw)
+
+            if not parsed_data:
+                raise ValueError("No valid draws were parsed from the data file.")
+
             self.data = pd.DataFrame(parsed_data)
-            self.data.sort_values('date', inplace=True)
+            pre_dedup = len(self.data)
+            self.data.drop_duplicates(subset=["date"], keep="last", inplace=True)
+            dropped = pre_dedup - len(self.data)
+            if dropped > 0:
+                logger.warning("Dropped %d duplicate draw dates while loading data.", dropped)
+            self.data.sort_values("date", inplace=True)
             self.data.reset_index(drop=True, inplace=True)
-            
-            logger.info(f"Successfully loaded {len(self.data)} draws.")
+
+            logger.info(
+                "Successfully loaded %d draws (blocks=%d, skipped=%d).",
+                len(self.data),
+                len(draw_blocks),
+                skipped_blocks + dropped,
+            )
             return self.data
             
         except Exception as e:
             logger.error(f"Error loading data: {str(e)}")
             raise
+
+    def _split_draw_blocks(self, lines: List[str]) -> List[List[str]]:
+        """Split raw file lines into per-draw blocks keyed by weekday headings."""
+        blocks: List[List[str]] = []
+        current_block: Optional[List[str]] = None
+
+        for line in lines:
+            if line in self._WEEKDAY_TOKENS:
+                if current_block:
+                    blocks.append(current_block)
+                current_block = [line]
+                continue
+
+            if current_block is None:
+                continue
+            current_block.append(line)
+
+        if current_block:
+            blocks.append(current_block)
+        return blocks
+
+    def _parse_draw_block(self, block: List[str]) -> Optional[Dict]:
+        """
+        Parse a draw block into a normalized row dict.
+        Expected shape is robust to jackpot formatting drift:
+        [weekday, date_line, 7 number lines, result/jackpot line].
+        """
+        if len(block) < 9:
+            logger.debug("Skipping short draw block: %s", block)
+            return None
+
+        weekday = block[0]
+        date_token = block[1] if len(block) > 1 else ""
+        date = self._parse_draw_date(f"{weekday} {date_token}")
+        if date is None:
+            logger.debug("Skipping draw with invalid date token: %s | %s", weekday, date_token)
+            return None
+
+        number_lines = block[2:-1]
+        number_tokens: List[int] = []
+        for line in number_lines:
+            for token in re.findall(r"\d+", line):
+                number_tokens.append(int(token))
+                if len(number_tokens) >= (N_MAIN + N_BONUS):
+                    break
+            if len(number_tokens) >= (N_MAIN + N_BONUS):
+                break
+
+        if len(number_tokens) < (N_MAIN + N_BONUS):
+            logger.debug("Skipping draw with insufficient numbers on %s: %s", date, block)
+            return None
+
+        numbers = number_tokens[: N_MAIN + N_BONUS]
+        main_numbers = numbers[:N_MAIN]
+        bonus_numbers = numbers[N_MAIN:]
+
+        if len(main_numbers) != N_MAIN or len(bonus_numbers) != N_BONUS:
+            logger.warning("Skipping malformed draw with wrong number counts: %s", numbers)
+            return None
+        if (
+            any(n < 1 or n > MAIN_NUMBER_RANGE for n in main_numbers)
+            or any(n < 1 or n > BONUS_NUMBER_RANGE for n in bonus_numbers)
+        ):
+            logger.warning("Skipping out-of-range draw on %s: %s | %s", date, main_numbers, bonus_numbers)
+            return None
+        if len(set(main_numbers)) != N_MAIN or len(set(bonus_numbers)) != N_BONUS:
+            logger.warning("Skipping duplicate-number draw on %s: %s | %s", date, main_numbers, bonus_numbers)
+            return None
+
+        tail = block[-1]
+        jackpot_match = self._JACKPOT_RE.search(tail)
+        result_match = self._RESULT_RE.search(tail)
+        jackpot = jackpot_match.group(1) if jackpot_match else ""
+        result = result_match.group(1).capitalize() if result_match else "Unknown"
+        if result == "-":
+            result = "Unknown"
+
+        return {
+            "date": date,
+            "main_numbers": sorted(main_numbers),
+            "bonus_numbers": sorted(bonus_numbers),
+            "jackpot": jackpot,
+            "result": result,
+        }
+
+    def _parse_draw_date(self, raw_date: str) -> Optional[datetime]:
+        """Parse a draw date with ordinal suffix cleanup and fallback formats."""
+        cleaned = self._DATE_ORDINAL_RE.sub(r"\1", raw_date.strip())
+        for fmt in ("%A %d %B %Y", "%A %d %b %Y"):
+            try:
+                return datetime.strptime(cleaned, fmt)
+            except ValueError:
+                continue
+        return None
 
     def calculate_gap_states(self, data: pd.DataFrame, main_range: int, bonus_range: int) -> Tuple[np.ndarray, np.ndarray]:
         """

@@ -2,7 +2,14 @@ import numpy as np
 import pandas as pd
 import logging
 from typing import List, Dict
-from .config import STATISTICAL_CONFIG, N_MAIN, N_BONUS, MAIN_NUMBER_RANGE, BONUS_NUMBER_RANGE
+from .config import (
+    STATISTICAL_CONFIG,
+    N_MAIN,
+    N_BONUS,
+    MAIN_NUMBER_RANGE,
+    BONUS_NUMBER_RANGE,
+    SAMPLING_CONFIG,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +22,7 @@ class StatisticalModel:
         self.main_recency = None
         self.bonus_recency = None
         self.params = STATISTICAL_CONFIG
+        self.sampling = SAMPLING_CONFIG
         
     def train(self, data: pd.DataFrame):
         """Analyze historical data to build statistical models."""
@@ -79,63 +87,146 @@ class StatisticalModel:
             raise ValueError("Model not trained. Call train() first.")
         if recent_data is None or recent_data.empty:
             raise ValueError("No recent data provided for prediction.")
-            
+
+        # Normalize recency scores (higher means more due).
+        main_recency_score = self.main_recency / (np.max(self.main_recency) + 1)
+        bonus_recency_score = self.bonus_recency / (np.max(self.bonus_recency) + 1)
+
+        # Mix hot and due signals. Normalize if custom weights don't sum to 1.
+        freq_weight = float(self.params.get("frequency_weight", 0.6))
+        recency_weight = float(self.params.get("recency_weight", 0.4))
+        mix_total = max(1e-9, freq_weight + recency_weight)
+        freq_weight /= mix_total
+        recency_weight /= mix_total
+
+        main_weights = (self.main_freq * freq_weight) + (main_recency_score * recency_weight)
+        bonus_weights = (self.bonus_freq * freq_weight) + (bonus_recency_score * recency_weight)
+
+        # Sharpen distributions so candidate ranking has clearer signal.
+        main_prob_vector = self._apply_sampling_bias(
+            main_weights,
+            top_k=self.sampling.get("top_k_main"),
+            temperature=self.sampling.get("temperature_main"),
+            top_p=self.sampling.get("top_p_main"),
+            required_nonzero=N_MAIN,
+        )
+        bonus_prob_vector = self._apply_sampling_bias(
+            bonus_weights,
+            top_k=self.sampling.get("top_k_bonus"),
+            temperature=self.sampling.get("temperature_bonus"),
+            top_p=self.sampling.get("top_p_bonus"),
+            required_nonzero=N_BONUS,
+        )
+
+        # Build deterministic elite candidates first, then stochastic tail for diversity.
+        main_order = np.argsort(main_prob_vector)[::-1]
+        bonus_order = np.argsort(bonus_prob_vector)[::-1]
+        elite_limit = max(2, min(num_predictions, int(self.params.get("elite_candidates", 12))))
+        main_step = max(1, int(self.params.get("elite_main_step", 3)))
+        bonus_step = max(1, int(self.params.get("elite_bonus_step", 1)))
+
         predictions = []
-        for _ in range(num_predictions):
-            # Calculate weights combining Frequency (Hot) and Recency (Due)
-            # We want a mix of Hot numbers and Due numbers
-            
-            # Normalize recency (higher is more due)
-            main_recency_score = self.main_recency / (np.max(self.main_recency) + 1)
-            bonus_recency_score = self.bonus_recency / (np.max(self.bonus_recency) + 1)
-            
-            # Combine scores (0.6 Freq, 0.4 Recency)
-            main_weights = (self.main_freq * 0.6) + (main_recency_score * 0.4)
-            bonus_weights = (self.bonus_freq * 0.6) + (bonus_recency_score * 0.4)
-            
-            # Add some noise for variety
-            main_weights += np.random.normal(0, 0.05, size=len(main_weights))
-            bonus_weights += np.random.normal(0, 0.05, size=len(bonus_weights))
-            
-            # Ensure non-negative
-            main_weights = np.maximum(main_weights, 0.001)
-            bonus_weights = np.maximum(bonus_weights, 0.001)
-            
-            # Normalize to sum to 1
-            main_weights /= np.sum(main_weights)
-            bonus_weights /= np.sum(bonus_weights)
-            # Keep a copy so we can expose the probability mass to downstream ranking
-            main_prob_vector = main_weights.copy()
-            bonus_prob_vector = bonus_weights.copy()
-            
-            # Sample
-            main_nums = np.random.choice(
-                np.arange(1, MAIN_NUMBER_RANGE + 1), 
-                size=N_MAIN, 
-                replace=False, 
-                p=main_weights
-            )
-            
-            bonus_nums = np.random.choice(
-                np.arange(1, BONUS_NUMBER_RANGE + 1), 
-                size=N_BONUS, 
-                replace=False, 
-                p=bonus_weights
-            )
-            
-            # Calculate confidence score based on historical frequency of selected numbers
-            main_conf = np.mean(main_prob_vector[main_nums-1])
-            bonus_conf = np.mean(bonus_prob_vector[bonus_nums-1])
-            
+        seen = set()
+        candidate_budget = max(num_predictions * 4, elite_limit)
+
+        for _ in range(candidate_budget):
+            if len(predictions) >= num_predictions:
+                break
+
+            idx = len(predictions)
+            if idx < elite_limit:
+                main_shift = (idx * main_step) % MAIN_NUMBER_RANGE
+                bonus_shift = (idx * bonus_step) % BONUS_NUMBER_RANGE
+                main_idx = np.take(main_order, np.arange(main_shift, main_shift + N_MAIN), mode="wrap")
+                bonus_idx = np.take(bonus_order, np.arange(bonus_shift, bonus_shift + N_BONUS), mode="wrap")
+            else:
+                main_idx = np.random.choice(
+                    np.arange(MAIN_NUMBER_RANGE),
+                    size=N_MAIN,
+                    replace=False,
+                    p=main_prob_vector,
+                )
+                bonus_idx = np.random.choice(
+                    np.arange(BONUS_NUMBER_RANGE),
+                    size=N_BONUS,
+                    replace=False,
+                    p=bonus_prob_vector,
+                )
+
+            main_nums = sorted((main_idx + 1).tolist())
+            bonus_nums = sorted((bonus_idx + 1).tolist())
+            combo_key = tuple(main_nums + bonus_nums)
+            if combo_key in seen:
+                continue
+            seen.add(combo_key)
+
+            main_conf = float(np.mean(main_prob_vector[main_idx]))
+            bonus_conf = float(np.mean(bonus_prob_vector[bonus_idx]))
+            confidence = (main_conf + bonus_conf) / 2.0
+
+            # Keep elite candidates slightly prioritized in downstream ranking.
+            if idx < elite_limit:
+                confidence *= 1.05
+
             predictions.append({
-                'main_numbers': sorted(main_nums.tolist()),
-                'bonus_numbers': sorted(bonus_nums.tolist()),
-                'confidence': float((main_conf + bonus_conf) / 2),
-                'main_prob_vector': main_prob_vector.tolist(),
-                'bonus_prob_vector': bonus_prob_vector.tolist(),
-                'expected_main_prob': float(np.sum(main_prob_vector[main_nums-1])),
-                'expected_bonus_prob': float(np.sum(bonus_prob_vector[bonus_nums-1])),
-                'source': 'Statistical'
+                "main_numbers": main_nums,
+                "bonus_numbers": bonus_nums,
+                "confidence": float(confidence),
+                "main_prob_vector": main_prob_vector.tolist(),
+                "bonus_prob_vector": bonus_prob_vector.tolist(),
+                "expected_main_prob": float(np.sum(main_prob_vector[main_idx])),
+                "expected_bonus_prob": float(np.sum(bonus_prob_vector[bonus_idx])),
+                "source": "Statistical",
             })
-            
+
         return predictions
+
+    def _apply_sampling_bias(
+        self,
+        probs: np.ndarray,
+        top_k: int,
+        temperature: float,
+        top_p: float = None,
+        required_nonzero: int = None,
+    ) -> np.ndarray:
+        """Apply temperature and top-k/top-p filtering to a probability vector."""
+        probs = np.array(probs, dtype=np.float64)
+        probs = np.maximum(probs, 1e-10)
+        probs /= np.sum(probs)
+        probs = np.clip(probs, 1e-10, 1.0 - 1e-10)
+
+        logits = np.log(probs / (1 - probs))
+        if temperature and temperature > 0:
+            logits = logits / temperature
+
+        exp_logits = np.exp(logits - np.max(logits))
+        probs = exp_logits / np.sum(exp_logits)
+
+        effective_top_k = top_k if top_k else probs.size
+        if required_nonzero is not None:
+            effective_top_k = max(effective_top_k, required_nonzero)
+
+        if top_p is not None and 0 < top_p < 1:
+            sorted_indices = np.argsort(probs)[::-1]
+            cumsum = np.cumsum(probs[sorted_indices])
+            cutoff_idx = np.searchsorted(cumsum, top_p) + 1
+            cutoff_idx = max(cutoff_idx, required_nonzero or 1)
+            nucleus_indices = sorted_indices[:cutoff_idx]
+            mask = np.zeros_like(probs)
+            mask[nucleus_indices] = 1.0
+            probs = probs * mask
+        elif effective_top_k and effective_top_k < probs.size:
+            top_indices = np.argpartition(probs, -effective_top_k)[-effective_top_k:]
+            mask = np.zeros_like(probs)
+            mask[top_indices] = 1.0
+            probs = probs * mask
+
+        total = probs.sum()
+        if total <= 0:
+            probs = np.ones_like(probs)
+            total = probs.sum()
+        if required_nonzero is not None and np.count_nonzero(probs) < required_nonzero:
+            probs = np.ones_like(probs)
+            total = probs.sum()
+
+        return probs / total
