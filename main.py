@@ -1,741 +1,276 @@
+"""
+EuroMillions ticket toolkit -- honest edition.
+
+One command gives you a complete play plan:
+
+    python3 main.py --jackpot 130000000 --budget 12.50
+
+No module here predicts numbers: for a fair draw that is impossible. The
+plan optimises the three levers a fair lottery actually leaves a player:
+expected-value steering (fewer co-winners), jackpot timing (EV per euro
+varies severalfold), and exact multi-ticket structure (probability mass
+moved toward "at least one ticket wins", computed by full enumeration).
+"""
+from __future__ import annotations
+
 import argparse
-import logging
 import json
+import logging
 import sys
-import random
-import os
 from pathlib import Path
+from typing import Any
 
-# Ensure matplotlib cache is writable before importing project modules that may import matplotlib.
-_project_dir = Path(__file__).resolve().parent
-_mpl_cache_dir = _project_dir / "predictions" / ".mplconfig"
-_mpl_cache_dir.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("MPLCONFIGDIR", str(_mpl_cache_dir))
+from src.config import PREDICTIONS_DIR, TICKET_COST
+from src.ev import BASE_JACKPOT, EVConfig, EVModel, JACKPOT_CAP
 
-import numpy as np
-from src.config import LOGS_DIR, PREDICTIONS_DIR
-from src.coverage import CoverageOptimizer
-from src.data import LotteryDataManager
-from src.neural import NeuralModel
-from src.statistical import StatisticalModel
-from src.tree import RandomForestModel, ExtraTreesModel
-from src.xgboost_model import XGBoostModel
-from src.consensus import ConsensusEngine
-
-# Setup logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOGS_DIR / "lottery_system.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
 logger = logging.getLogger(__name__)
 
 
-def _passes_abstain_gate(
-    pred: dict,
-    min_score: float,
-    min_confidence: float,
-    min_expected_main_prob: float,
-    min_support_count: int,
-) -> bool:
-    score = float(pred.get("final_score", pred.get("confidence", 0.0)) or 0.0)
-    confidence = float(pred.get("confidence", 0.0) or 0.0)
-    expected_main = float(pred.get("expected_main_prob", 0.0) or 0.0)
-    support_count = int(pred.get("support_count", 1) or 1)
-    return (
-        score >= float(min_score)
-        and confidence >= float(min_confidence)
-        and expected_main >= float(min_expected_main_prob)
-        and support_count >= int(min_support_count)
+def configure_logging() -> None:
+    if getattr(configure_logging, "_configured", False):
+        return
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    configure_logging._configured = True
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run with no flags (or just --jackpot and --budget) to get a complete "
+            "play plan: a draw verdict, the tickets to play, and their exact odds. "
+            "Nothing here predicts numbers; nothing can."
+        ),
+    )
+    parser.add_argument(
+        "--jackpot",
+        type=float,
+        default=BASE_JACKPOT,
+        help="Advertised jackpot in EUR for the draw (default: 17M minimum).",
+    )
+    parser.add_argument(
+        "--budget",
+        type=float,
+        default=0.0,
+        help=f"Budget in EUR; tickets = budget / {TICKET_COST:.2f}. Overrides --tickets.",
+    )
+    parser.add_argument("--tickets", type=int, default=5, help="Number of tickets to play (default 5).")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (same seed = same tickets).")
+    parser.add_argument(
+        "--sales",
+        type=float,
+        default=0.0,
+        help="Europe-wide tickets sold (0 = estimate from cached FDJ winner counts).",
+    )
+    parser.add_argument(
+        "--compare-random",
+        type=int,
+        default=3,
+        help="Random same-budget portfolios to exact-evaluate as a baseline (0 = skip).",
+    )
+    parser.add_argument(
+        "--ev-table",
+        action="store_true",
+        help="Print expected value per ticket across jackpot levels and exit.",
+    )
+    parser.add_argument(
+        "--validate-ev",
+        action="store_true",
+        help="Validate the co-winner crowding model against actual FDJ winner counts and exit.",
+    )
+    parser.add_argument(
+        "--calibrate-popularity",
+        action="store_true",
+        help=(
+            "Fit popularity weights from official FDJ winners-per-tier archives "
+            "(drop the ZIPs in lottery_data/) and exit."
+        ),
+    )
+    return parser
+
+
+def build_ev_model(args: argparse.Namespace) -> EVModel:
+    return EVModel(
+        EVConfig(
+            jackpot=max(0.0, float(args.jackpot)),
+            sales=float(args.sales) if args.sales else None,
+        )
     )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Hybrid Lottery Number Generator")
-    parser.add_argument("--predictions", type=int, default=5, help="Number of predictions to generate")
-    parser.add_argument(
-        "--strategy",
-        choices=["hybrid", "coverage"],
-        default="hybrid",
-        help="Prediction strategy: model-based hybrid or coverage-optimized tickets",
+def save_json(payload: Any, output_file: Path) -> None:
+    output_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def draw_verdict(ev_model: EVModel) -> list[str]:
+    """Plain-language assessment of whether this draw is worth playing."""
+    ev_now = ev_model.neutral_ev()["ev_eur"]
+    ev_base = EVModel(
+        EVConfig(jackpot=BASE_JACKPOT, sales=ev_model.sales),
+        main_weights=ev_model.main_weights,
+        bonus_weights=ev_model.bonus_weights,
+    ).neutral_ev()["ev_eur"]
+    per_euro = ev_now / ev_model.config.ticket_price
+    ratio = ev_now / ev_base
+    jackpot = ev_model.config.jackpot
+
+    lines = [
+        f"Advertised jackpot EUR {jackpot:,.0f}; a EUR {ev_model.config.ticket_price:.2f} ticket "
+        f"returns ~EUR {ev_now:.2f} in expectation ({per_euro:.0%} back per euro)."
+    ]
+    if jackpot < 50e6:
+        lines.append(
+            f"Verdict: LOW-VALUE DRAW ({ratio:.1f}x the minimum-jackpot rate). If you can, "
+            f"wait for a rollover above EUR 100M -- the same ticket returns ~2x more per euro there."
+        )
+    elif jackpot < 150e6:
+        lines.append(
+            f"Verdict: DECENT ROLLOVER ({ratio:.1f}x the minimum-jackpot rate). "
+            f"Meaningfully better than a base draw; bigger rollovers are better still."
+        )
+    else:
+        lines.append(
+            f"Verdict: NEAR THE BEST THIS GAME OFFERS ({ratio:.1f}x the minimum-jackpot rate; "
+            f"cap is EUR {JACKPOT_CAP:,.0f}). Note: huge jackpots pull in extra players, "
+            f"so treat this as an upper bound."
+        )
+    lines.append(
+        "Reality check: expected value stays below the ticket price at every jackpot. "
+        "Play for fun, never for profit."
     )
-    parser.add_argument(
-        "--model-profile",
-        choices=["validated", "balanced", "full"],
-        default="validated",
-        help="Model set for hybrid strategy: validated (fast), balanced (adds RF), or full (all sources)",
+    return lines
+
+
+def run_play(args: argparse.Namespace) -> None:
+    from src.portfolio import build_portfolio, compare_to_random, evaluate_portfolio
+
+    num_tickets = max(1, int(args.budget / TICKET_COST) if args.budget > 0 else args.tickets)
+    cost = num_tickets * TICKET_COST
+    ev_model = build_ev_model(args)
+
+    records = build_portfolio(num_tickets, ev_model, seed=args.seed)
+    tickets = [(tuple(r["main_numbers"]), tuple(r["bonus_numbers"])) for r in records]
+    stats = evaluate_portfolio(tickets)
+    stats.portfolio_ev_eur = float(sum(r["ev_eur"] for r in records))
+
+    print("================ PLAY PLAN ================")
+    for line in draw_verdict(ev_model):
+        print(line)
+    print()
+    print(f"--- Play these {num_tickets} line(s) (EUR {cost:.2f}) ---")
+    for index, record in enumerate(records, 1):
+        mains = " ".join(f"{n:2d}" for n in record["main_numbers"])
+        stars = " ".join(f"{n:2d}" for n in record["bonus_numbers"])
+        print(f"  {index}) {mains}  +  stars {stars}")
+    print()
+    print("--- Why these lines ---")
+    avg_crowding = sum(r["jackpot_crowding"] for r in records) / len(records)
+    print(
+        f"Unpopular combinations: if a line wins, it expects ~{avg_crowding:.1f}x the co-winners "
+        f"of an average line (lower is better; jackpot split with fewer people)."
     )
-    parser.add_argument("--use-neural", action="store_true", help="Include neural model in hybrid prediction")
-    parser.add_argument("--use-rf", action="store_true", help="Include Random Forest model in hybrid prediction")
-    parser.add_argument("--use-et", action="store_true", help="Include Extra Trees model in hybrid prediction")
-    parser.add_argument("--use-xgb", action="store_true", help="Include XGBoost model in hybrid prediction")
-    parser.add_argument(
-        "--coverage-candidates",
-        type=int,
-        default=2000,
-        help="Random candidates per ticket for coverage strategy",
+    print(f"Portfolio EV EUR {stats.portfolio_ev_eur:.2f} for EUR {cost:.2f} spent.")
+    print()
+    print("--- Exact odds for this set (full enumeration, no simulation) ---")
+    print(f"P(at least one line wins any prize):   {stats.p_any_prize:.2%}")
+    print(f"P(at least one line matches 3+ mains): {stats.p_three_plus_mains:.2%}")
+    if args.compare_random > 0:
+        baseline = compare_to_random(
+            tickets, ev_model=ev_model, n_baselines=args.compare_random, seed=args.seed
+        )
+        print(
+            f"Same budget on random quick-picks:     {baseline['mean_p_any_prize']:.2%} any prize, "
+            f"EV EUR {baseline.get('mean_portfolio_ev_eur', float('nan')):.2f}"
+        )
+    output_file = PREDICTIONS_DIR / "play_plan.json"
+    save_json(
+        {
+            "jackpot": ev_model.config.jackpot,
+            "num_tickets": num_tickets,
+            "cost_eur": cost,
+            "verdict": draw_verdict(ev_model),
+            "tickets": records,
+            "exact_stats": stats.to_dict(),
+        },
+        output_file,
     )
-    parser.add_argument("--force-train", action="store_true", help="Force retraining of neural models")
-    parser.add_argument("--rl-train", action="store_true", help="Fine-tune models using PPO (RL)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible sampling")
-    parser.add_argument("--backtest", action="store_true", help="Run backtesting framework")
-    parser.add_argument("--backtest-compare", action="store_true", help="Run controlled baseline vs improved backtest comparison")
-    parser.add_argument("--backtest-window", type=int, default=50, help="Number of past draws to backtest")
-    parser.add_argument("--backtest-topk", type=int, default=2, help="Number of top-ranked predictions to evaluate per draw during backtest")
-    parser.add_argument("--backtest-use-neural", action="store_true", help="Include neural model (if weights exist) in backtest inference")
-    parser.add_argument(
-        "--backtest-neural-mode",
-        choices=["frozen", "rolling"],
-        default="frozen",
-        help="Neural backtest mode: frozen pre-trained model or rolling leak-safe retrain",
+    print(f"\nSaved to: {output_file}")
+    print(
+        "Honesty note: every line has identical odds of winning; these are optimised only "
+        "to share less when they win and to spread the set. Long-run cost is unchanged."
     )
-    parser.add_argument(
-        "--backtest-neural-retrain-interval",
-        type=int,
-        default=8,
-        help="Draw interval between rolling neural retrains in backtest mode",
+
+
+def run_ev_table(args: argparse.Namespace) -> None:
+    ev_model = build_ev_model(args)
+    print("=== EV per ticket vs jackpot (sales held fixed) ===")
+    print(f"Sales: {ev_model.sales:,.0f} tickets ({ev_model.sales_source}); ticket price EUR {TICKET_COST:.2f}.")
+    for row in ev_model.jackpot_sweep():
+        marker = " <- cap" if row["jackpot"] >= JACKPOT_CAP else ""
+        print(
+            f"  Jackpot EUR {row['jackpot']:>13,.0f}: neutral-ticket EV EUR {row['neutral_ev']:.4f} "
+            f"({row['neutral_ev_per_euro']:.3f} per euro){marker}"
+        )
+    print(
+        "Reading: EV varies severalfold with the jackpot but stays below the ticket price -- "
+        "'when to play' dominates 'what to pick'."
     )
-    parser.add_argument(
-        "--backtest-neural-train-window",
-        type=int,
-        default=400,
-        help="Number of recent draws used for each rolling neural retrain",
+
+
+def run_validate_ev(_: argparse.Namespace) -> None:
+    from src.ev import validate_crowding
+
+    report = validate_crowding()
+    print("=== Crowding model vs actual FDJ winner counts ===")
+    print(f"Draws: {report['n_draws']}  Weights: {report['weights_source']}")
+    for tier, metrics in report["per_tier"].items():
+        print(
+            f"  {tier}: R2 model={metrics['r2_model']:+.3f} vs uniform={metrics['r2_uniform_baseline']:+.3f} "
+            f"(mean winners/draw {metrics['mean_winners']:,.0f})"
+        )
+    print(f"Mean R2 improvement over uniform baseline: {report['mean_r2_improvement_over_uniform']}")
+    report_file = PREDICTIONS_DIR / "ev_validation_report.json"
+    save_json(report, report_file)
+    print(f"Report: {report_file}")
+
+
+def run_calibrate(_: argparse.Namespace) -> None:
+    from src.popularity_fit import FIT_REPORT_FILE, FITTED_WEIGHTS_FILE, run_calibration
+
+    result = run_calibration()
+    validation = result.diagnostics.get("validation", {})
+    print("=== Popularity Calibration ===")
+    print(
+        f"Draws used: {result.diagnostics.get('n_draws')} "
+        f"({' to '.join(result.diagnostics.get('date_range', []))})"
     )
-    parser.add_argument(
-        "--backtest-neural-epochs",
-        type=int,
-        default=10,
-        help="Epochs per rolling neural retrain",
-    )
-    parser.add_argument(
-        "--backtest-neural-batch-size",
-        type=int,
-        default=32,
-        help="Batch size for rolling neural retrain",
-    )
-    parser.add_argument(
-        "--backtest-neural-min-retrains",
-        type=int,
-        default=2,
-        help="Minimum successful rolling neural retrains before using neural predictions",
-    )
-    parser.add_argument(
-        "--backtest-no-ensemble",
-        action="store_true",
-        help="Disable ensemble candidate generation in backtest",
-    )
-    parser.add_argument(
-        "--backtest-no-filter-fit",
-        action="store_true",
-        help="Disable adaptive filter fitting in backtest",
-    )
-    parser.add_argument("--backtest-skip-statistical", action="store_true", help="Skip statistical model during backtest")
-    parser.add_argument("--backtest-skip-rf", action="store_true", help="Skip random forest model during backtest")
-    parser.add_argument("--backtest-skip-et", action="store_true", help="Skip extra trees model during backtest")
-    parser.add_argument("--backtest-skip-xgb", action="store_true", help="Skip XGBoost model during backtest")
-    parser.add_argument(
-        "--backtest-fast-models",
-        action="store_true",
-        help="Use reduced-complexity RF/ET/XGBoost models for faster backtests",
-    )
-    parser.add_argument(
-        "--backtest-fast-level",
-        choices=["fast", "ultrafast"],
-        default="fast",
-        help="Speed preset used when --backtest-fast-models is enabled",
-    )
-    parser.add_argument(
-        "--backtest-model-retrain-interval",
-        type=int,
-        default=1,
-        help="Retrain classical models every N backtest draws (1 = retrain every draw)",
-    )
-    parser.add_argument(
-        "--backtest-no-source-performance",
-        action="store_true",
-        help="Disable adaptive source weighting from rolling backtest performance",
-    )
-    parser.add_argument(
-        "--backtest-source-performance-window",
-        type=int,
-        default=20,
-        help="Rolling window of prior draws used for source performance weighting",
-    )
-    parser.add_argument(
-        "--backtest-source-performance-min-samples",
-        type=int,
-        default=4,
-        help="Minimum prior samples before source performance weighting is applied",
-    )
-    parser.add_argument(
-        "--backtest-enable-abstain",
-        action="store_true",
-        help="Enable abstain mode in backtest when candidates do not meet quality thresholds",
-    )
-    parser.add_argument(
-        "--backtest-abstain-min-score",
-        type=float,
-        default=0.10,
-        help="Minimum final score required to place a backtest ticket in abstain mode",
-    )
-    parser.add_argument(
-        "--backtest-abstain-min-confidence",
-        type=float,
-        default=0.0,
-        help="Minimum confidence required to place a backtest ticket in abstain mode",
-    )
-    parser.add_argument(
-        "--backtest-abstain-min-expected-main-prob",
-        type=float,
-        default=0.0,
-        help="Minimum expected main probability mass required in backtest abstain mode",
-    )
-    parser.add_argument(
-        "--backtest-abstain-min-support-count",
-        type=int,
-        default=1,
-        help="Minimum cross-source support count required in backtest abstain mode",
-    )
-    parser.add_argument(
-        "--backtest-auto-tune-consensus",
-        action="store_true",
-        help="Enable rolling prequential consensus profile auto-tuning in backtest",
-    )
-    parser.add_argument(
-        "--backtest-auto-tune-interval",
-        type=int,
-        default=3,
-        help="Draw interval between consensus auto-tune profile updates in backtest",
-    )
-    parser.add_argument(
-        "--backtest-auto-tune-window",
-        type=int,
-        default=24,
-        help="Rolling reward window used by backtest consensus auto-tuning",
-    )
-    parser.add_argument(
-        "--backtest-auto-tune-exploration",
-        type=float,
-        default=0.15,
-        help="Exploration strength for UCB-style backtest consensus auto-tuning",
-    )
-    parser.add_argument(
-        "--no-readiness-gate",
-        action="store_true",
-        help="Disable readiness gate before hybrid prediction generation",
-    )
-    parser.add_argument(
-        "--readiness-allow-unready",
-        action="store_true",
-        help="Allow hybrid prediction generation even when readiness gate fails",
-    )
-    parser.add_argument(
-        "--readiness-window",
-        type=int,
-        default=20,
-        help="Backtest window used by readiness gate",
-    )
-    parser.add_argument(
-        "--readiness-topk",
-        type=int,
-        default=2,
-        help="Top-k predictions per draw used by readiness gate",
-    )
-    parser.add_argument(
-        "--readiness-fast-level",
-        choices=["default", "fast", "ultrafast"],
-        default="ultrafast",
-        help="Model speed profile used by readiness gate",
-    )
-    parser.add_argument(
-        "--readiness-model-retrain-interval",
-        type=int,
-        default=3,
-        help="Model retrain interval used by readiness gate",
-    )
-    parser.add_argument(
-        "--readiness-min-draws",
-        type=int,
-        default=20,
-        help="Minimum evaluated draws required for readiness pass",
-    )
-    parser.add_argument(
-        "--readiness-min-avg-lift",
-        type=float,
-        default=0.03,
-        help="Minimum average lift vs baseline required to pass readiness gate",
-    )
-    parser.add_argument(
-        "--readiness-min-rolling-lift",
-        type=float,
-        default=0.02,
-        help="Minimum latest rolling lift required to pass readiness gate",
-    )
-    parser.add_argument(
-        "--readiness-rolling-window",
-        type=int,
-        default=8,
-        help="Rolling window size for readiness lift checks",
-    )
-    parser.add_argument(
-        "--readiness-confidence",
-        type=float,
-        default=0.90,
-        help="Two-sided confidence level for readiness lift interval",
-    )
-    parser.add_argument(
-        "--readiness-min-ci-lower",
-        type=float,
-        default=0.0,
-        help="Minimum confidence-interval lower bound for readiness lift",
-    )
-    parser.add_argument(
-        "--readiness-report-tag",
-        type=str,
-        default="readiness",
-        help="Report tag used for readiness artifacts",
-    )
-    parser.add_argument(
-        "--readiness-min-tickets",
-        type=int,
-        default=10,
-        help="Minimum evaluated tickets required for readiness pass",
-    )
-    parser.add_argument(
-        "--readiness-min-roi-per-ticket",
-        type=float,
-        default=0.0,
-        help="Minimum projected ROI per ticket required to pass readiness",
-    )
-    parser.add_argument(
-        "--readiness-min-roi-ci-lower",
-        type=float,
-        default=0.0,
-        help="Minimum lower confidence bound for ROI per ticket in readiness",
-    )
-    parser.add_argument(
-        "--readiness-profit-confidence",
-        type=float,
-        default=0.90,
-        help="Two-sided confidence level for ROI per-ticket readiness interval",
-    )
-    parser.add_argument(
-        "--readiness-no-abstain",
-        action="store_true",
-        help="Disable abstain mode during readiness gate backtesting",
-    )
-    parser.add_argument(
-        "--readiness-abstain-min-score",
-        type=float,
-        default=0.12,
-        help="Minimum final score required to place a readiness ticket in abstain mode",
-    )
-    parser.add_argument(
-        "--readiness-abstain-min-confidence",
-        type=float,
-        default=0.0,
-        help="Minimum confidence required to place a readiness ticket in abstain mode",
-    )
-    parser.add_argument(
-        "--readiness-abstain-min-expected-main-prob",
-        type=float,
-        default=0.35,
-        help="Minimum expected main probability mass required in readiness abstain mode",
-    )
-    parser.add_argument(
-        "--readiness-abstain-min-support-count",
-        type=int,
-        default=1,
-        help="Minimum support count required in readiness abstain mode",
-    )
-    parser.add_argument(
-        "--readiness-no-auto-tune-consensus",
-        action="store_true",
-        help="Disable rolling consensus auto-tuning during readiness backtest",
-    )
-    parser.add_argument(
-        "--readiness-auto-tune-interval",
-        type=int,
-        default=3,
-        help="Draw interval between readiness consensus auto-tune profile updates",
-    )
-    parser.add_argument(
-        "--readiness-auto-tune-window",
-        type=int,
-        default=24,
-        help="Rolling reward window used by readiness consensus auto-tuning",
-    )
-    parser.add_argument(
-        "--readiness-auto-tune-exploration",
-        type=float,
-        default=0.15,
-        help="Exploration strength for readiness consensus auto-tuning",
-    )
-    parser.add_argument(
-        "--enable-abstain",
-        action="store_true",
-        help="Enable abstain mode for live hybrid generation",
-    )
-    parser.add_argument(
-        "--abstain-min-score",
-        type=float,
-        default=0.12,
-        help="Minimum final score required to output a live ticket in abstain mode",
-    )
-    parser.add_argument(
-        "--abstain-min-confidence",
-        type=float,
-        default=0.0,
-        help="Minimum confidence required to output a live ticket in abstain mode",
-    )
-    parser.add_argument(
-        "--abstain-min-expected-main-prob",
-        type=float,
-        default=0.35,
-        help="Minimum expected main probability mass required in live abstain mode",
-    )
-    parser.add_argument(
-        "--abstain-min-support-count",
-        type=int,
-        default=1,
-        help="Minimum support count required in live abstain mode",
-    )
-    args = parser.parse_args()
-    
+    print(f"Main-number holdout fit: {validation.get('main_fitted')}")
+    print(f"Heuristic prior (same holdout): {validation.get('main_prior_heuristic')}")
+    print(f"Star holdout fit: {validation.get('star_fitted')}")
+    print(f"Weights: {FITTED_WEIGHTS_FILE}")
+    print(f"Report:  {FIT_REPORT_FILE}")
+
+
+def main() -> None:
+    configure_logging()
+    args = build_parser().parse_args()
+
     try:
-        logger.info("=== Starting Hybrid Lottery Analysis System ===")
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        
-        if args.backtest:
-            from src.backtest import Backtester, run_controlled_comparison
-            model_speed_profile = args.backtest_fast_level if args.backtest_fast_models else "default"
-            if args.backtest_compare:
-                run_controlled_comparison(
-                    window=args.backtest_window,
-                    top_k=args.backtest_topk,
-                    seed=args.seed,
-                    use_neural=args.backtest_use_neural,
-                    neural_retrain_interval=args.backtest_neural_retrain_interval,
-                    neural_train_window=args.backtest_neural_train_window,
-                    neural_train_epochs=args.backtest_neural_epochs,
-                    neural_batch_size=args.backtest_neural_batch_size,
-                    neural_min_retrains_for_inference=args.backtest_neural_min_retrains,
-                    include_statistical=not args.backtest_skip_statistical,
-                    include_random_forest=not args.backtest_skip_rf,
-                    include_extra_trees=not args.backtest_skip_et,
-                    include_xgboost=not args.backtest_skip_xgb,
-                    model_speed_profile=model_speed_profile,
-                    model_retrain_interval=args.backtest_model_retrain_interval,
-                    use_source_performance_weights=not args.backtest_no_source_performance,
-                    source_performance_window=args.backtest_source_performance_window,
-                    source_performance_min_samples=args.backtest_source_performance_min_samples,
-                    enable_abstain=args.backtest_enable_abstain,
-                    abstain_min_score=args.backtest_abstain_min_score,
-                    abstain_min_confidence=args.backtest_abstain_min_confidence,
-                    abstain_min_expected_main_prob=args.backtest_abstain_min_expected_main_prob,
-                    abstain_min_support_count=args.backtest_abstain_min_support_count,
-                    auto_tune_consensus=args.backtest_auto_tune_consensus,
-                    auto_tune_interval=args.backtest_auto_tune_interval,
-                    auto_tune_window=args.backtest_auto_tune_window,
-                    auto_tune_exploration=args.backtest_auto_tune_exploration,
-                )
-            else:
-                bt = Backtester(
-                    window=args.backtest_window,
-                    top_k=args.backtest_topk,
-                    use_neural=args.backtest_use_neural,
-                    seed=args.seed,
-                    use_ensemble=not args.backtest_no_ensemble,
-                    fit_filter_thresholds=not args.backtest_no_filter_fit,
-                    neural_mode=args.backtest_neural_mode,
-                    neural_retrain_interval=args.backtest_neural_retrain_interval,
-                    neural_train_window=args.backtest_neural_train_window,
-                    neural_train_epochs=args.backtest_neural_epochs,
-                    neural_batch_size=args.backtest_neural_batch_size,
-                    neural_min_retrains_for_inference=args.backtest_neural_min_retrains,
-                    include_statistical=not args.backtest_skip_statistical,
-                    include_random_forest=not args.backtest_skip_rf,
-                    include_extra_trees=not args.backtest_skip_et,
-                    include_xgboost=not args.backtest_skip_xgb,
-                    model_speed_profile=model_speed_profile,
-                    model_retrain_interval=args.backtest_model_retrain_interval,
-                    use_source_performance_weights=not args.backtest_no_source_performance,
-                    source_performance_window=args.backtest_source_performance_window,
-                    source_performance_min_samples=args.backtest_source_performance_min_samples,
-                    enable_abstain=args.backtest_enable_abstain,
-                    abstain_min_score=args.backtest_abstain_min_score,
-                    abstain_min_confidence=args.backtest_abstain_min_confidence,
-                    abstain_min_expected_main_prob=args.backtest_abstain_min_expected_main_prob,
-                    abstain_min_support_count=args.backtest_abstain_min_support_count,
-                    auto_tune_consensus=args.backtest_auto_tune_consensus,
-                    auto_tune_interval=args.backtest_auto_tune_interval,
-                    auto_tune_window=args.backtest_auto_tune_window,
-                    auto_tune_exploration=args.backtest_auto_tune_exploration,
-                )
-                bt.run()
-            return
-
-        if args.strategy == "coverage":
-            optimizer = CoverageOptimizer()
-            coverage_preds = optimizer.generate(
-                args.predictions,
-                candidates_per_ticket=args.coverage_candidates,
-            )
-            output_file = PREDICTIONS_DIR / "coverage_predictions.json"
-            with open(output_file, "w") as f:
-                json.dump(coverage_preds, f, indent=4)
-
-            print("\n=== Coverage-Optimized Tickets ===")
-            for i, pred in enumerate(coverage_preds, 1):
-                score = pred.get("coverage_score", 0.0)
-                print(f"\nPick {i} (Coverage Score: {score:.2f})")
-                print(f"Main: {pred['main_numbers']}")
-                print(f"Bonus: {pred['bonus_numbers']}")
-
-            logger.info(f"Coverage picks saved to {output_file}")
-            logger.info("=== Execution Complete ===")
-            return
-        
-        # 1. Load Data
-        logger.info("Loading data...")
-        data_manager = LotteryDataManager()
-        data = data_manager.load_data()
-
-        profile_defaults = {
-            "validated": {"stat": True, "neural": False, "rf": False, "et": False, "xgb": False},
-            "balanced": {"stat": True, "neural": False, "rf": True, "et": False, "xgb": False},
-            "full": {"stat": True, "neural": True, "rf": True, "et": True, "xgb": True},
-        }
-        selected_models = profile_defaults[args.model_profile].copy()
-
-        # Force-train and RL fine-tuning both imply neural model usage.
-        if args.force_train or args.rl_train:
-            selected_models["neural"] = True
-
-        # Explicit model flags allow opting in extra sources when using validated profile.
-        if args.use_neural:
-            selected_models["neural"] = True
-        if args.use_rf:
-            selected_models["rf"] = True
-        if args.use_et:
-            selected_models["et"] = True
-        if args.use_xgb:
-            selected_models["xgb"] = True
-
-        logger.info("Hybrid model profile=%s selected_models=%s", args.model_profile, selected_models)
-        recommended_consensus_profile = None
-
-        if not args.no_readiness_gate:
-            from src.backtest import evaluate_readiness_gate
-
-            logger.info(
-                "Running readiness gate (window=%d, top_k=%d, profile=%s)...",
-                args.readiness_window,
-                args.readiness_topk,
-                args.readiness_fast_level,
-            )
-            readiness = evaluate_readiness_gate(
-                window=args.readiness_window,
-                top_k=args.readiness_topk,
-                seed=args.seed,
-                use_neural=selected_models["neural"],
-                neural_mode="frozen",
-                include_statistical=selected_models["stat"],
-                include_random_forest=selected_models["rf"],
-                include_extra_trees=selected_models["et"],
-                include_xgboost=selected_models["xgb"],
-                model_speed_profile=args.readiness_fast_level,
-                model_retrain_interval=args.readiness_model_retrain_interval,
-                min_avg_lift=args.readiness_min_avg_lift,
-                min_rolling_lift=args.readiness_min_rolling_lift,
-                rolling_window=args.readiness_rolling_window,
-                confidence=args.readiness_confidence,
-                min_ci_lower=args.readiness_min_ci_lower,
-                min_draws=args.readiness_min_draws,
-                min_tickets=args.readiness_min_tickets,
-                min_roi_per_ticket=args.readiness_min_roi_per_ticket,
-                min_roi_ci_lower=args.readiness_min_roi_ci_lower,
-                profit_confidence=args.readiness_profit_confidence,
-                enable_abstain=not args.readiness_no_abstain,
-                abstain_min_score=args.readiness_abstain_min_score,
-                abstain_min_confidence=args.readiness_abstain_min_confidence,
-                abstain_min_expected_main_prob=args.readiness_abstain_min_expected_main_prob,
-                abstain_min_support_count=args.readiness_abstain_min_support_count,
-                auto_tune_consensus=not args.readiness_no_auto_tune_consensus,
-                auto_tune_interval=args.readiness_auto_tune_interval,
-                auto_tune_window=args.readiness_auto_tune_window,
-                auto_tune_exploration=args.readiness_auto_tune_exploration,
-                report_tag=args.readiness_report_tag,
-            )
-            passed = bool(readiness.get("passed"))
-            metrics = readiness.get("metrics", {})
-            checks = readiness.get("checks", {})
-            recommended_consensus_profile = (
-                readiness.get("summary", {}).get("consensus_profile_last")
-            )
-            logger.info(
-                "Readiness gate verdict=%s checks=%s metrics={avg_lift=%.4f, rolling_lift=%.4f, ci_lower=%.4f, draws=%s}",
-                "PASS" if passed else "FAIL",
-                checks,
-                float(metrics.get("avg_lift", 0.0)),
-                float(metrics.get("rolling_lift", 0.0)),
-                float(metrics.get("ci_lower", 0.0)),
-                metrics.get("draws_evaluated", 0),
-            )
-            if not passed and not args.readiness_allow_unready:
-                print("\n=== Readiness Gate: BLOCKED ===")
-                print("Hybrid prediction generation stopped because readiness criteria were not met.")
-                print(f"See report: {PREDICTIONS_DIR / f'{args.readiness_report_tag}_report.json'}")
-                print("Use --readiness-allow-unready to override intentionally.")
-                sys.exit(2)
-            if not passed and args.readiness_allow_unready:
-                logger.warning("Continuing despite readiness failure due to --readiness-allow-unready.")
-        
-        # 2. Initialize Models
-        logger.info("Initializing models...")
-        neural_model = NeuralModel() if selected_models["neural"] else None
-        stat_model = StatisticalModel() if selected_models["stat"] else None
-        rf_model = RandomForestModel() if selected_models["rf"] else None
-        et_model = ExtraTreesModel() if selected_models["et"] else None
-        xgb_model = XGBoostModel() if selected_models["xgb"] else None
-        consensus = ConsensusEngine()
-        consensus.fit_filters(data)
-        if recommended_consensus_profile:
-            profile_map = ConsensusEngine.tuning_profiles()
-            selected_profile = profile_map.get(str(recommended_consensus_profile))
-            if selected_profile:
-                consensus.set_tuning_profile(selected_profile)
-                logger.info(
-                    "Applied readiness-selected consensus profile '%s' for live generation.",
-                    recommended_consensus_profile,
-                )
-        
-        # 3. Train/Load Models
-        if stat_model is not None:
-            stat_model.train(data)
-
-        if rf_model is not None:
-            rf_model.train(data)
-
-        if et_model is not None:
-            et_model.train(data)
-
-        if xgb_model is not None:
-            xgb_model.train(data)
-
-        if neural_model is not None:
-            neural_model.build_models()
-            if args.force_train:
-                neural_model.train(data)
-            elif not neural_model.models_loaded:
-                logger.warning(
-                    "Neural weights not found; skipping neural source. Use --force-train to train from scratch."
-                )
-                neural_model = None
-            
-        # RL Fine-Tuning (PPO)
-        if args.rl_train:
-            if neural_model is None:
-                logger.warning("Skipping PPO fine-tuning: neural model is unavailable.")
-            else:
-                neural_model.train_ppo(data)
-            
-        # 4. Generate Predictions
-        logger.info(f"Generating {args.predictions} candidates per model...")
-        
-        # Generate more candidates internally for filtering
-        n_candidates = max(args.predictions * 4, 20)
-        
-        all_preds = []
-        if neural_model is not None:
-            all_preds += neural_model.predict(data, num_predictions=n_candidates)
-        if stat_model is not None:
-            all_preds += stat_model.predict(data, num_predictions=n_candidates)
-        if rf_model is not None:
-            all_preds += rf_model.predict(data, num_predictions=n_candidates)
-        if et_model is not None:
-            all_preds += et_model.predict(data, num_predictions=n_candidates)
-        if xgb_model is not None:
-            all_preds += xgb_model.predict(data, num_predictions=n_candidates)
-
-        if not all_preds:
-            raise ValueError("No predictions were generated. Enable at least one model.")
-
-        # 5. Generate Ensemble Predictions (combines probability distributions).
-        # Skip when only one probabilistic source is present; blending a single source
-        # with itself adds noise but no new information.
-        prob_sources = {
-            p.get("source", "Unknown")
-            for p in all_preds
-            if p.get("main_prob_vector") is not None and p.get("bonus_prob_vector") is not None
-        }
-        ensemble_preds = []
-        if len(prob_sources) >= 2:
-            logger.info("Generating ensemble predictions...")
-            ensemble_preds = consensus.ensemble_predictions(all_preds, num_outputs=args.predictions)
+        if args.calibrate_popularity:
+            run_calibrate(args)
+        elif args.validate_ev:
+            run_validate_ev(args)
+        elif args.ev_table:
+            run_ev_table(args)
         else:
-            logger.info("Skipping ensemble generation: need >=2 probabilistic sources, got %d", len(prob_sources))
+            run_play(args)
+    except Exception as exc:
+        logger.error("Fatal error: %s", exc, exc_info=True)
+        raise SystemExit(1) from exc
 
-        # 6. Consensus Ranking
-        logger.info("Ranking candidates...")
-        ranked_preds = consensus.rank_predictions(all_preds + ensemble_preds)
-
-        # Select top N with diversity-aware chooser
-        final_predictions = consensus.choose_diverse_top(ranked_preds, args.predictions)
-
-        if args.enable_abstain:
-            before_count = len(final_predictions)
-            final_predictions = [
-                pred
-                for pred in final_predictions
-                if _passes_abstain_gate(
-                    pred,
-                    min_score=args.abstain_min_score,
-                    min_confidence=args.abstain_min_confidence,
-                    min_expected_main_prob=args.abstain_min_expected_main_prob,
-                    min_support_count=args.abstain_min_support_count,
-                )
-            ]
-            logger.info(
-                "Live abstain filter retained %d/%d predictions.",
-                len(final_predictions),
-                before_count,
-            )
-            if not final_predictions:
-                print("\n=== Abstain Signal ===")
-                print("No tickets generated: all candidates failed abstain quality thresholds.")
-
-        # 7. Output Results
-        output_file = PREDICTIONS_DIR / "hybrid_predictions.json"
-        with open(output_file, 'w') as f:
-            json.dump(final_predictions, f, indent=4)
-            
-        print("\n=== Top Predictions ===")
-        for i, pred in enumerate(final_predictions, 1):
-            print(f"\nRank {i} (Score: {pred['final_score']:.4f} | Source: {pred['source']})")
-            print(f"Main: {pred['main_numbers']}")
-            print(f"Bonus: {pred['bonus_numbers']}")
-            em = pred.get('expected_main_prob')
-            eb = pred.get('expected_bonus_prob')
-            if em is not None or eb is not None:
-                em_str = f"{em:.3f}" if em is not None else "n/a"
-                eb_str = f"{eb:.3f}" if eb is not None else "n/a"
-                print(f"Prob mass (selected nums): Main {em_str} | Bonus {eb_str}")
-            
-        logger.info(f"Predictions saved to {output_file}")
-        logger.info("=== Execution Complete ===")
-        
-    except Exception as e:
-        logger.error(f"Fatal error: {str(e)}", exc_info=True)
-        sys.exit(1)
 
 if __name__ == "__main__":
     main()
-
-# python3 main.py --force-train --rl-train --predictions 5
-# python3 main.py --backtest --backtest-window 50 --backtest-topk 2 --backtest-use-neural

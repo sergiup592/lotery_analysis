@@ -1,0 +1,135 @@
+{
+  "fitted_at_utc": "2026-06-10T09:55:25.594859+00:00",
+  "main_weights": [
+    1.096476,
+    1.094286,
+    1.174356,
+    1.089905,
+    1.087715,
+    1.085525,
+    1.233151,
+    1.081144,
+    1.078954,
+    1.076764,
+    1.156834,
+    1.072383,
+    1.158042,
+    1.073591,
+    1.071401,
+    1.069211,
+    1.149281,
+    1.06483,
+    1.06264,
+    1.06045,
+    1.05826,
+    1.056069,
+    1.053879,
+    1.051689,
+    1.049499,
+    1.047309,
+    1.045118,
+    1.042928,
+    1.040738,
+    1.038548,
+    1.036357,
+    0.895891,
+    0.8937,
+    0.89151,
+    0.88932,
+    0.88713,
+    0.884939,
+    0.882749,
+    0.880559,
+    0.878369,
+    0.855706,
+    0.853516,
+    0.851325,
+    0.849135,
+    0.846945,
+    0.844755,
+    0.842565,
+    0.840374,
+    0.838184,
+    0.835994
+  ],
+  "bonus_weights": [
+    1.032656,
+    1.037483,
+    1.04231,
+    1.047137,
+    1.051965,
+    1.056792,
+    1.179202,
+    1.066446,
+    1.071273,
+    0.800085,
+    0.804912,
+    0.809739
+  ],
+  "main_coefficients": {
+    "intercept": 0.90921,
+    "calendar_day": 0.13814,
+    "month_range": -0.00558,
+    "lucky_set": 0.08218,
+    "seven": 0.06749,
+    "high_range": -0.02045,
+    "linear_trend": -0.1094
+  },
+  "bonus_coefficients": {
+    "intercept": 0.78537,
+    "seven": 0.11791,
+    "legacy_range": 0.27678,
+    "linear_trend": 0.05809
+  },
+  "diagnostics": {
+    "n_draws": 1013,
+    "date_range": [
+      "2016-09-27",
+      "2026-06-09"
+    ],
+    "scope_counts": {
+      "europe": 1012,
+      "france": 1
+    },
+    "rank_mapping_check": {
+      "log_count_vs_log_prob_correlation": 1.0,
+      "implied_median_tickets_per_draw": 23586959.0
+    },
+    "usable_main_measurements": 1013,
+    "usable_star_measurements": 1013,
+    "median_measurement_se_main": 0.00284,
+    "main_signal_sd": 0.06716,
+    "star_signal_sd": 0.11322,
+    "validation": {
+      "holdout_draws": 203,
+      "main_fitted": {
+        "n": 203,
+        "r_squared": 0.463,
+        "correlation": 0.7153,
+        "rmse": 0.044,
+        "actual_sd": 0.06004
+      },
+      "star_fitted": {
+        "n": 203,
+        "r_squared": 0.7616,
+        "correlation": 0.8782,
+        "rmse": 0.04799,
+        "actual_sd": 0.09828
+      },
+      "main_prior_heuristic": {
+        "n": 203,
+        "r_squared": -0.2687,
+        "correlation": 0.6854,
+        "rmse": 0.06763,
+        "actual_sd": 0.06004
+      },
+      "star_prior_heuristic": {
+        "n": 203,
+        "r_squared": 0.3717,
+        "correlation": 0.6306,
+        "rmse": 0.0779,
+        "actual_sd": 0.09828
+      }
+    }
+  }
+}

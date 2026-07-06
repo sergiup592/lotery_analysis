@@ -1,397 +1,152 @@
-# Lottery Analysis System
+# EuroMillions Ticket Toolkit
 
-This project builds and evaluates lottery ticket candidates for a fixed **5 + 2** format:
+An honest toolkit for a EuroMillions-style draw (5/50 mains + 2/12 stars).
+It does **not** predict numbers — nothing can — but it squeezes out every
+legitimate edge a fair lottery leaves a player, with exact math and
+empirically calibrated inputs.
 
-- Main numbers: choose 5 from `1..50`
-- Bonus numbers: choose 2 from `1..12`
-- Input data: [`lottery_data/lottery_numbers.txt`](lottery_data/lottery_numbers.txt)
+## What is and is not possible
 
-It supports two generation modes:
+Draws come from audited physical machines: balls matched to ~0.1 mg,
+machines rotated and independently tested. The process has no memory and no
+learnable state, so **every ticket has identical odds in every tier**.
+Frequency analysis, hot/cold numbers, LSTMs, gradient boosting — all of it
+is noise-fitting. Earlier versions of this project implemented those models
+and measured their walk-forward lift: zero, exactly as theory predicts. They
+have been removed.
 
-- `hybrid`: model-based candidate generation + consensus ranking
-- `coverage`: non-predictive combinatorial diversification
+What ticket choice *does* control — because most prize tiers are
+pari-mutuel (split among winners) — is **how many people you share with
+when you do win**. Humans over-pick birthdays, lucky numbers, and visual
+patterns. Three real levers remain, and this toolkit implements all of
+them:
 
-It also includes leak-safe backtesting, a readiness gate, abstain mode, and optional neural PPO fine-tuning.
+1. **EV steering** — pick combinations fewer people play (~+20% expected
+   payout per ticket).
+2. **Jackpot timing** — EV per euro varies ~4x between a EUR 17M and a
+   EUR 250M jackpot. The biggest lever by far.
+3. **Portfolio structure** — for multi-ticket play, move probability mass
+   toward "at least one ticket wins" (exactly computed, ~+10 points at 10
+   tickets vs random quick-picks).
 
-## Important Reality Check
+Even all three combined never push EV above the EUR 2.50 ticket price.
+Anyone claiming otherwise is selling something.
 
-This repository is a research/engineering system for ranking ticket candidates, not a guaranteed way to predict lottery outcomes.  
-Backtest improvements do not imply real-world certainty.
+## Quick start from scratch
 
-## Table of Contents
-
-- [How It Works](#how-it-works)
-- [Project Structure](#project-structure)
-- [Data Format](#data-format)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Modes and Workflows](#modes-and-workflows)
-- [Full CLI Reference](#full-cli-reference)
-- [Output Files](#output-files)
-- [Environment Variables and Acceleration](#environment-variables-and-acceleration)
-- [Exit Codes](#exit-codes)
-
-## How It Works
-
-### Hybrid flow (`--strategy hybrid`)
-
-1. Parse and normalize historical draws from `lottery_data/lottery_numbers.txt`.
-2. Select model sources from `--model-profile` (and optional `--use-*` flags).
-3. Run readiness gate by default (unless `--no-readiness-gate`).
-4. Train/initialize enabled models:
-   - Statistical
-   - RandomForest (optional)
-   - ExtraTrees (optional)
-   - XGBoost (optional)
-   - Neural Transformer (optional)
-5. Generate candidate tickets from active sources.
-6. Optionally generate ensemble candidates if at least 2 probabilistic sources are available.
-7. Rank with adaptive consensus weights + statistical filters + diversity-aware selection.
-8. Optionally apply live abstain filter.
-9. Save to `predictions/hybrid_predictions.json`.
-
-### Coverage flow (`--strategy coverage`)
-
-- Generates tickets by maximizing coverage of number pairs and cross-pairs.
-- Uses random candidate search per ticket (`--coverage-candidates`).
-- Saves to `predictions/coverage_predictions.json`.
-
-### Backtesting
-
-- Walk-forward, leak-safe backtest over recent draws.
-- Supports random baseline comparison, abstain mode, and consensus profile auto-tuning.
-- Saves summary JSON + plot PNG artifacts under `predictions/`.
-
-### Readiness gate (default before hybrid generation)
-
-Runs an internal backtest and blocks hybrid generation unless criteria pass:
-
-- minimum evaluated draws
-- minimum evaluated tickets
-- minimum average lift vs random baseline
-- minimum latest rolling lift
-- minimum confidence-interval lower bound for lift
-- minimum ROI per ticket
-- minimum ROI CI lower bound
-
-If blocked and not overridden, process exits with code `2`.
-
-## Project Structure
-
-```text
-.
-├── main.py
-├── requirements.txt
-├── lottery_data/
-│   └── lottery_numbers.txt
-├── src/
-│   ├── data.py            # parser + feature engineering
-│   ├── statistical.py     # statistical source
-│   ├── tree.py            # random forest + extra trees
-│   ├── xgboost_model.py   # xgboost source
-│   ├── neural.py          # transformer + PPO fine-tuning
-│   ├── consensus.py       # ranking / diversity / blending
-│   ├── backtest.py        # backtest + readiness + comparison
-│   ├── coverage.py        # coverage optimizer
-│   ├── filters.py         # statistical hard/soft filters
-│   ├── acceleration.py    # TF/XGBoost device config helpers
-│   └── config.py          # constants and paths
-├── models/                # persisted neural model files
-├── predictions/           # generated artifacts
-└── logs/                  # runtime logs
-```
-
-## Data Format
-
-The parser expects repeated draw blocks that begin with a weekday line and include a date, then 7 numbers, then jackpot/result.
-
-Example:
-
-```text
-Tuesday
-13th January 2026
-6
-10
-18
-44
-47
-2
-10
-€64,537,877    Roll
-```
-
-Notes:
-
-- Dates support formats like `Tuesday 13 January 2026` and `Tuesday 13 Jan 2026`.
-- Duplicate draw dates are deduplicated (latest block kept).
-- Main/bonus counts and ranges are validated.
-
-## Installation
-
-1. Create and activate a virtual environment.
-2. Install dependencies.
+Requires Python 3.10+.
 
 ```bash
+git clone <this-repo> && cd lotery_analysis   # or copy the folder
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate                      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+
+# Confirm everything works (fast, ~5s)
+python3 -m unittest discover -s tests -v
 ```
 
-`requirements.txt` includes:
+### The one command
 
-- `pandas`, `numpy`, `scikit-learn`, `xgboost`, `tensorflow`, `scipy`, `matplotlib`
-
-On macOS, you may need OpenMP:
+Look up the advertised jackpot for the next draw, decide your budget, run:
 
 ```bash
-brew install libomp
+python3 main.py --jackpot 130000000 --budget 12.50
 ```
 
-Optional Apple Silicon acceleration:
+That prints a complete **play plan**: a verdict on whether this draw is
+worth playing at all, the exact lines to put on the playslip, why those
+lines (co-winner crowding, EV in euros), and the exact odds of the set vs
+the same budget on random quick-picks. Also saved to
+`predictions/play_plan.json`. With no flags at all, `python3 main.py`
+assumes the EUR 17M minimum jackpot and 5 tickets. Same `--seed` = same
+lines; change it for a fresh set.
+
+### Supporting commands
 
 ```bash
-pip install tensorflow-macos tensorflow-metal
+python3 main.py --ev-table      # EV per ticket across jackpot levels (when to play)
+python3 main.py --validate-ev   # check the co-winner model against real winner counts
 ```
 
-## Quick Start
+The repo ships with calibrated inputs (`lottery_data/winner_counts.csv`,
+`lottery_data/popularity_fitted.json`), so everything above works
+immediately. Results are also written as JSON to `predictions/`.
 
-Generate hybrid predictions with defaults:
+### Refreshing the calibration (optional, recommended twice a year)
 
-```bash
-python3 main.py
+Popularity weights are fitted from official FDJ archives that record the
+Europe-wide number of winners at each of the 13 prize ranks for every draw
+— the only public signal of what other players pick.
+
+1. Download the EuroMillions history ZIPs (Sep 2016 onwards) from
+   [fdj.fr](https://www.fdj.fr/jeux-de-tirage/euromillions-my-million/historique)
+   and drop them into `lottery_data/` (no need to unzip).
+2. `python3 main.py --calibrate-popularity`
+
+All generators pick up the refreshed weights automatically; the ticket
+printout names the active source.
+
+## How each piece works
+
+**EV engine (`src/ev.py`).** Prices every ticket in euros across all 13
+tiers: exact hypergeometric tier probabilities x official fund allocations
+(EUR 1.10 per line into the Common Prize Fund; jackpot tier uses the
+advertised jackpot) x expected pari-mutuel share `E[1/(1+K)]` with
+`K ~ Poisson(lambda)`. The co-winner intensity comes from the crowding
+model calibrated on the FDJ winner counts. Full-main-match tiers price the
+exact line (product of pick weights, elementary-symmetric normalised, times
+documented pattern priors), so 1-2-3-4-5 is correctly priced as
+catastrophically shared (~200x crowding). `--validate-ev` checks the model
+against reality: on 1,013 archived draws it explains 26-60% of per-tier
+winner-share variance (uniform baseline ~0, mean R^2 improvement +0.40).
+
+**Exact portfolio structure (`src/portfolio.py`).** Enumerates all
+C(50,5) = 2,118,760 possible main draws (vectorised popcount, ~0.2s) and
+folds stars in analytically — exact probabilities, no simulation.
+Construction uses disjoint mains (a permutation-invariance argument makes
+any disjoint portfolio exactly equivalent on the main side, so number choice
+is spent purely on EV), distinct unpopular star pairs, then an EV polish.
+The printout always shows `E[winning tickets]`, which is identical for
+every portfolio — structure only reshapes the distribution, never the mean.
+Guarantee-style wheels (La Jolla Covering Repository; Cushing & Stewart's
+27-ticket UK Lotto construction) are the classical alternative; famously,
+the guaranteed win usually pays less than the tickets cost, which is why
+this repo reports exact probabilities and euros instead.
+
+**Popularity calibration (`src/popularity_fit.py`, `src/winner_data.py`).**
+Within-draw ratios of adjacent prize tiers cancel ticket sales and every
+draw-level effect, leaving a direct per-draw measurement of how over-picked
+the drawn numbers were (the Riedwyl & Henze / Farrell et al. approach).
+Weighted least squares on interpretable features recovers per-number pick
+weights; holdout metrics are reported next to the heuristic priors they
+replace. Current fit: calendar numbers ~+10%, number 7 +23%, stars 10-12
+about -20% (legacy playslip habits).
+
+**Ticket selection (`src/coverage.py`).** Builds candidate pools (including
+anti-popular candidates sampled inversely to pick weights), then selects a
+diversified set scored by EV with overlap penalties and coverage bonuses.
+
+## Project layout
+
+```
+main.py                  CLI: play plan by default; --ev-table / --validate-ev / --calibrate-popularity
+src/config.py            game constants, paths, selection defaults
+src/ev.py                economic EV engine + crowding validation
+src/portfolio.py         exact portfolio evaluation + construction
+src/coverage.py          candidate pools + diversified selection
+src/popularity.py        pick-weight model (fitted file with heuristic fallback)
+src/popularity_fit.py    calibration from FDJ winner counts
+src/winner_data.py       FDJ archive ingestion (ZIP/CSV, defensive parsing)
+tests/                   42 tests incl. exactness proofs vs Monte Carlo
+lottery_data/            calibrated inputs (+ drop FDJ ZIPs here to refit)
+predictions/             JSON outputs (gitignored)
 ```
 
-Generate coverage-only tickets:
+## Honest summary
 
-```bash
-python3 main.py --strategy coverage --predictions 10
-```
-
-Run backtest:
-
-```bash
-python3 main.py --backtest --backtest-window 50 --backtest-topk 2
-```
-
-Run baseline vs improved comparison:
-
-```bash
-python3 main.py --backtest --backtest-compare --backtest-window 50 --backtest-topk 2
-```
-
-## Modes and Workflows
-
-### Model profiles (`hybrid`)
-
-- `validated` (default): statistical only
-- `balanced`: statistical + random forest
-- `full`: statistical + neural + random forest + extra trees + xgboost
-
-You can add sources explicitly with:
-
-- `--use-neural`
-- `--use-rf`
-- `--use-et`
-- `--use-xgb`
-
-`--force-train` and `--rl-train` implicitly enable neural source.
-
-### Neural training and PPO
-
-Train neural weights from scratch:
-
-```bash
-python3 main.py --force-train
-```
-
-Run PPO fine-tuning (requires usable neural models):
-
-```bash
-python3 main.py --rl-train
-```
-
-Train + PPO + generate:
-
-```bash
-python3 main.py --force-train --rl-train --predictions 5
-```
-
-Neural artifacts are saved in `models/`:
-
-- `models/main_transformer.keras`
-- `models/bonus_transformer.keras`
-
-### Readiness gate behavior
-
-Default behavior for hybrid mode:
-
-- readiness gate is ON
-- readiness backtest uses abstain mode by default
-- readiness backtest auto-tunes consensus profile by default
-- recommended consensus profile from readiness is reused in live generation
-
-Override controls:
-
-```bash
-python3 main.py --no-readiness-gate
-python3 main.py --readiness-allow-unready
-python3 main.py --readiness-no-abstain --readiness-no-auto-tune-consensus
-```
-
-### Live abstain mode
-
-Skip weak live tickets instead of forcing output:
-
-```bash
-python3 main.py \
-  --no-readiness-gate \
-  --enable-abstain \
-  --abstain-min-score 0.12 \
-  --abstain-min-expected-main-prob 0.35
-```
-
-If all candidates fail thresholds, `hybrid_predictions.json` is saved as an empty list.
-
-### Backtest speed controls
-
-```bash
-python3 main.py \
-  --backtest \
-  --backtest-fast-models \
-  --backtest-fast-level ultrafast \
-  --backtest-model-retrain-interval 3
-```
-
-## Full CLI Reference
-
-### Core options
-
-| Flag | Type / Choices | Default | Description |
-|---|---|---|---|
-| `--predictions` | `int` | `5` | Number of predictions to generate. |
-| `--strategy` | `hybrid \| coverage` | `hybrid` | Prediction strategy. |
-| `--model-profile` | `validated \| balanced \| full` | `validated` | Model set for hybrid strategy. |
-| `--use-neural` | flag | `False` | Include neural model in hybrid prediction. |
-| `--use-rf` | flag | `False` | Include random forest model in hybrid prediction. |
-| `--use-et` | flag | `False` | Include extra trees model in hybrid prediction. |
-| `--use-xgb` | flag | `False` | Include XGBoost model in hybrid prediction. |
-| `--coverage-candidates` | `int` | `2000` | Random candidates per ticket in coverage mode. |
-| `--force-train` | flag | `False` | Force retraining of neural models. |
-| `--rl-train` | flag | `False` | Run PPO fine-tuning. |
-| `--seed` | `int` | `42` | Reproducible random seed. |
-
-### Backtest options
-
-| Flag | Type / Choices | Default |
-|---|---|---|
-| `--backtest` | flag | `False` |
-| `--backtest-compare` | flag | `False` |
-| `--backtest-window` | `int` | `50` |
-| `--backtest-topk` | `int` | `2` |
-| `--backtest-use-neural` | flag | `False` |
-| `--backtest-neural-mode` | `frozen \| rolling` | `frozen` |
-| `--backtest-neural-retrain-interval` | `int` | `8` |
-| `--backtest-neural-train-window` | `int` | `400` |
-| `--backtest-neural-epochs` | `int` | `10` |
-| `--backtest-neural-batch-size` | `int` | `32` |
-| `--backtest-neural-min-retrains` | `int` | `2` |
-| `--backtest-no-ensemble` | flag | `False` |
-| `--backtest-no-filter-fit` | flag | `False` |
-| `--backtest-skip-statistical` | flag | `False` |
-| `--backtest-skip-rf` | flag | `False` |
-| `--backtest-skip-et` | flag | `False` |
-| `--backtest-skip-xgb` | flag | `False` |
-| `--backtest-fast-models` | flag | `False` |
-| `--backtest-fast-level` | `fast \| ultrafast` | `fast` |
-| `--backtest-model-retrain-interval` | `int` | `1` |
-| `--backtest-no-source-performance` | flag | `False` |
-| `--backtest-source-performance-window` | `int` | `20` |
-| `--backtest-source-performance-min-samples` | `int` | `4` |
-| `--backtest-enable-abstain` | flag | `False` |
-| `--backtest-abstain-min-score` | `float` | `0.10` |
-| `--backtest-abstain-min-confidence` | `float` | `0.0` |
-| `--backtest-abstain-min-expected-main-prob` | `float` | `0.0` |
-| `--backtest-abstain-min-support-count` | `int` | `1` |
-| `--backtest-auto-tune-consensus` | flag | `False` |
-| `--backtest-auto-tune-interval` | `int` | `3` |
-| `--backtest-auto-tune-window` | `int` | `24` |
-| `--backtest-auto-tune-exploration` | `float` | `0.15` |
-
-### Readiness gate options
-
-| Flag | Type / Choices | Default |
-|---|---|---|
-| `--no-readiness-gate` | flag | `False` |
-| `--readiness-allow-unready` | flag | `False` |
-| `--readiness-window` | `int` | `20` |
-| `--readiness-topk` | `int` | `2` |
-| `--readiness-fast-level` | `default \| fast \| ultrafast` | `ultrafast` |
-| `--readiness-model-retrain-interval` | `int` | `3` |
-| `--readiness-min-draws` | `int` | `20` |
-| `--readiness-min-avg-lift` | `float` | `0.03` |
-| `--readiness-min-rolling-lift` | `float` | `0.02` |
-| `--readiness-rolling-window` | `int` | `8` |
-| `--readiness-confidence` | `float` | `0.90` |
-| `--readiness-min-ci-lower` | `float` | `0.0` |
-| `--readiness-report-tag` | `str` | `readiness` |
-| `--readiness-min-tickets` | `int` | `10` |
-| `--readiness-min-roi-per-ticket` | `float` | `0.0` |
-| `--readiness-min-roi-ci-lower` | `float` | `0.0` |
-| `--readiness-profit-confidence` | `float` | `0.90` |
-| `--readiness-no-abstain` | flag | `False` |
-| `--readiness-abstain-min-score` | `float` | `0.12` |
-| `--readiness-abstain-min-confidence` | `float` | `0.0` |
-| `--readiness-abstain-min-expected-main-prob` | `float` | `0.35` |
-| `--readiness-abstain-min-support-count` | `int` | `1` |
-| `--readiness-no-auto-tune-consensus` | flag | `False` |
-| `--readiness-auto-tune-interval` | `int` | `3` |
-| `--readiness-auto-tune-window` | `int` | `24` |
-| `--readiness-auto-tune-exploration` | `float` | `0.15` |
-
-### Live abstain options (hybrid generation)
-
-| Flag | Type | Default |
-|---|---|---|
-| `--enable-abstain` | flag | `False` |
-| `--abstain-min-score` | `float` | `0.12` |
-| `--abstain-min-confidence` | `float` | `0.0` |
-| `--abstain-min-expected-main-prob` | `float` | `0.35` |
-| `--abstain-min-support-count` | `int` | `1` |
-
-## Output Files
-
-Generated under `predictions/`:
-
-- `hybrid_predictions.json`: final hybrid picks (possibly empty if abstain filters all).
-- `coverage_predictions.json`: coverage-optimized picks (coverage strategy runs).
-- `backtest_summary.json`: summary from a standard backtest run.
-- `backtest_accuracy.png`: rolling performance and hit distribution plot from a standard backtest run.
-- `backtest_summary_<tag>.json`: tagged summaries (e.g., baseline/improved/readiness) when tagged runs are used.
-- `backtest_accuracy_<tag>.png`: tagged plots (e.g., baseline/improved/readiness) when tagged runs are used.
-- `backtest_comparison.json`: controlled baseline vs improved comparison output (`--backtest-compare`).
-- `<report_tag>_report.json`: readiness gate report (`readiness_report.json` by default).
-
-Other runtime outputs:
-
-- `logs/lottery_system.log`: application logs.
-- `models/main_transformer.keras`, `models/bonus_transformer.keras`: saved neural models.
-
-## Environment Variables and Acceleration
-
-- `XGBOOST_FORCE_CPU=1`: force XGBoost to CPU.
-- `XGBOOST_FORCE_GPU=1`: force XGBoost GPU mode if CUDA build exists.
-- `TF_MIXED_PRECISION=0`: disable TensorFlow mixed precision (enabled by default when GPU is available).
-
-The app also sets `MPLCONFIGDIR` to `predictions/.mplconfig` to keep Matplotlib cache writable.
-
-## Exit Codes
-
-- `0`: successful completion.
-- `1`: fatal runtime error.
-- `2`: readiness gate blocked hybrid generation (unless overridden with `--readiness-allow-unready`).
-
-## Additional Notes
-
-- Backtest ROI uses a simplified hypothetical payout curve based on **main hits only** (`3->10`, `4->100`, `5->100000`) and ticket cost `1`.
-- Ensemble candidates are generated only when at least 2 probabilistic sources are present.
-- If neural weights are missing and not force-trained, neural source is skipped with a warning.
+Playing EuroMillions loses money in expectation, always. If you play
+anyway: play rollover draws not base draws, pick unpopular combinations,
+spread multi-ticket budgets disjointly — and treat the ticket as
+entertainment, not investment. This toolkit makes each of those choices
+optimal and shows its work.
