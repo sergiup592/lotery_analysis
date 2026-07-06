@@ -23,7 +23,8 @@ class PopcountTests(unittest.TestCase):
     def test_both_popcount_implementations_match_python(self):
         rng = np.random.default_rng(1)
         values = rng.integers(0, 2**63, size=1000, dtype=np.uint64)
-        expected = np.array([int(v).bit_count() for v in values], dtype=np.uint64)
+        # bin().count() instead of int.bit_count() so the test runs on Python 3.9.
+        expected = np.array([bin(int(v)).count("1") for v in values], dtype=np.uint64)
         np.testing.assert_array_equal(popcount64(values).astype(np.uint64), expected)
         np.testing.assert_array_equal(_popcount64_lut(values).astype(np.uint64), expected)
 

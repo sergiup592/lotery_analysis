@@ -34,7 +34,7 @@ Anyone claiming otherwise is selling something.
 
 ## Quick start from scratch
 
-Requires Python 3.10+.
+Requires Python 3.9+.
 
 ```bash
 git clone <this-repo> && cd lotery_analysis   # or copy the folder
