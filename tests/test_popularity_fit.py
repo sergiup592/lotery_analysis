@@ -16,7 +16,12 @@ from src.popularity_fit import (
     star_feature_matrix,
     tier_probability,
 )
-from src.winner_data import RANK_TIERS, load_winner_counts
+from src.winner_data import (
+    RANK_TIERS,
+    load_winner_counts,
+    read_winner_counts_cache,
+    write_winner_counts_cache,
+)
 
 
 def synthetic_winner_frame(
@@ -157,6 +162,37 @@ class ArchiveParsingTests(unittest.TestCase):
         self.assertEqual(frame.iloc[0]["main_numbers"], [7, 13, 21, 34, 48])
         self.assertEqual(frame.iloc[0]["bonus_numbers"], [3, 9])
         self.assertEqual(int(frame.iloc[0]["winners_rank_13"]), 1_300_000)
+
+    def test_new_archive_merges_with_existing_cache(self):
+        # Dropping only the NEWEST FDJ file must extend the cached history,
+        # not replace it (the append-new-draws workflow).
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_path = Path(tmp_dir) / "winner_counts.csv"
+            old_row = {
+                "date": pd.Timestamp("2016-10-04"),
+                "main_numbers": [2, 11, 24, 36, 45],
+                "bonus_numbers": [4, 8],
+                "scope": "europe",
+            }
+            for rank in RANK_TIERS:
+                old_row[f"winners_rank_{rank}"] = 1000 * rank
+            write_winner_counts_cache(pd.DataFrame([old_row]), cache_path)
+
+            archive_path = Path(tmp_dir) / "euromillions_latest.zip"
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("euromillions.csv", self._fdj_csv())
+            archive_path.write_bytes(buffer.getvalue())
+
+            frame = load_winner_counts(
+                archive_paths=[archive_path], use_cache=True, cache_path=cache_path
+            )
+
+            self.assertEqual(len(frame), 3)  # 1 cached + 2 era draws from the new zip
+            self.assertEqual(str(frame["date"].min().date()), "2016-10-04")
+            self.assertEqual(str(frame["date"].max().date()), "2017-01-20")
+            # And the cache on disk was extended too.
+            self.assertEqual(len(read_winner_counts_cache(cache_path)), 3)
 
     def test_plain_csv_with_unlabelled_winner_columns(self):
         winner_headers = ";".join(f"nombre_de_gagnant_au_rang{rank}" for rank in range(1, 14))

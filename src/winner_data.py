@@ -263,12 +263,17 @@ def load_winner_counts(
     archive_paths: Optional[Sequence[Path]] = None,
     use_cache: bool = True,
     era_start: str = BONUS_ERA_START,
+    cache_path: Path = WINNER_COUNTS_CACHE,
 ) -> pd.DataFrame:
     """
     Tidy per-draw winner counts for the current star era, sorted by date.
 
     Columns: date, main_numbers (list[int]), bonus_numbers (list[int]),
     winners_rank_1 .. winners_rank_13.
+
+    Append-friendly: newly parsed archives are MERGED with the existing cache
+    (fresh archives win on duplicate dates), so dropping only the latest FDJ
+    ZIP into lottery_data/ extends the dataset instead of replacing it.
     """
     if archive_paths is None:
         archive_paths = discover_archive_files()
@@ -280,14 +285,22 @@ def load_winner_counts(
     ]
 
     if not frames:
-        if use_cache and WINNER_COUNTS_CACHE.exists():
-            logger.info("No archives found; using cache %s", WINNER_COUNTS_CACHE)
-            return read_winner_counts_cache()
+        if use_cache and cache_path.exists():
+            logger.info("No archives found; using cache %s", cache_path)
+            return read_winner_counts_cache(cache_path)
         raise FileNotFoundError(
             "No FDJ winner-count archives found. Download the EuroMillions "
             "history ZIPs from https://www.fdj.fr/jeux-de-tirage/euromillions-my-million/historique "
             f"and place them in {DATA_DIR}."
         )
+
+    if use_cache and cache_path.exists():
+        try:
+            cached = read_winner_counts_cache(cache_path)
+            frames.insert(0, cached)  # archives override the cache on duplicate dates
+            logger.info("Merging %d cached draws with newly parsed archives.", len(cached))
+        except (OSError, ValueError, KeyError) as exc:
+            logger.warning("Could not merge existing cache %s: %s", cache_path, exc)
 
     merged = pd.concat(frames, ignore_index=True)
     merged.drop_duplicates(subset=["date"], keep="last", inplace=True)
@@ -299,7 +312,7 @@ def load_winner_counts(
 
     _validate_winner_counts(merged)
     if use_cache:
-        write_winner_counts_cache(merged)
+        write_winner_counts_cache(merged, cache_path)
     return merged
 
 

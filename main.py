@@ -63,7 +63,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--sales",
         type=float,
         default=0.0,
-        help="Europe-wide tickets sold (0 = estimate from cached FDJ winner counts).",
+        help="Europe-wide tickets sold (0 = jackpot-elasticity model calibrated on the archive).",
+    )
+    parser.add_argument(
+        "--must-be-won",
+        action="store_true",
+        help=(
+            "Price this as the capped 5th draw where the jackpot MUST be won "
+            "(rolls down to the next winning tier if nobody matches 5+2). "
+            "The only draw type where EV can exceed the ticket price."
+        ),
+    )
+    parser.add_argument(
+        "--raffle-prize",
+        type=float,
+        default=0.0,
+        help="Country raffle prize in EUR (e.g. 1000000 for FDJ My Million / UK Millionaire Maker).",
+    )
+    parser.add_argument(
+        "--raffle-pool",
+        type=float,
+        default=0.0,
+        help="Tickets competing for that raffle (your country's sales this draw; lower on Tuesdays).",
     )
     parser.add_argument(
         "--compare-random",
@@ -97,12 +118,35 @@ def build_ev_model(args: argparse.Namespace) -> EVModel:
         EVConfig(
             jackpot=max(0.0, float(args.jackpot)),
             sales=float(args.sales) if args.sales else None,
+            must_be_won=bool(getattr(args, "must_be_won", False)),
+            raffle_prize=max(0.0, float(getattr(args, "raffle_prize", 0.0))),
+            raffle_pool=max(0.0, float(getattr(args, "raffle_pool", 0.0))),
         )
     )
 
 
 def save_json(payload: Any, output_file: Path) -> None:
     output_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def calibration_freshness_note(max_age_days: int = 180) -> str | None:
+    """Nudge to recalibrate when the winner-count data is getting old."""
+    try:
+        import pandas as pd
+
+        from src.winner_data import read_winner_counts_cache
+
+        last_draw = pd.Timestamp(read_winner_counts_cache()["date"].max())
+        age_days = (pd.Timestamp.now() - last_draw).days
+    except Exception:  # noqa: BLE001 - purely informational
+        return None
+    if age_days > max_age_days:
+        return (
+            f"Heads-up: calibration data ends {last_draw.date()} ({age_days} days ago). "
+            f"Player behaviour drifts slowly; drop fresh FDJ ZIPs into lottery_data/ and run "
+            f"'python3 main.py --calibrate-popularity' to refresh."
+        )
+    return None
 
 
 def draw_verdict(ev_model: EVModel) -> list[str]:
@@ -121,6 +165,20 @@ def draw_verdict(ev_model: EVModel) -> list[str]:
         f"Advertised jackpot EUR {jackpot:,.0f}; a EUR {ev_model.config.ticket_price:.2f} ticket "
         f"returns ~EUR {ev_now:.2f} in expectation ({per_euro:.0%} back per euro)."
     ]
+    if ev_model.config.must_be_won:
+        rolldown = ev_model.neutral_ev()["ev_rolldown_component"]
+        lines.append(
+            f"MUST-BE-WON DRAW: if nobody matches 5+2, the EUR {jackpot:,.0f} rolls down to the "
+            f"next winning tier (worth ~EUR {rolldown:.2f}/ticket of the EV above). This is the "
+            f"only draw type where EV can exceed the ticket price"
+            + (" -- and here it does." if ev_now > ev_model.config.ticket_price else ".")
+        )
+        lines.append(
+            "Rolldowns are real (17 Nov 2006: EUR 183M shared by twenty 5+1 winners at EUR 9.6M "
+            "each), but rare: most cap cycles end in a jackpot win first. EV-positive still means "
+            "you almost surely lose this EUR 2.50 -- the mean is carried by a ~1-in-7M event."
+        )
+        return lines
     if jackpot < 50e6:
         lines.append(
             f"Verdict: LOW-VALUE DRAW ({ratio:.1f}x the minimum-jackpot rate). If you can, "
@@ -198,6 +256,9 @@ def run_play(args: argparse.Namespace) -> None:
         output_file,
     )
     print(f"\nSaved to: {output_file}")
+    freshness = calibration_freshness_note()
+    if freshness:
+        print(freshness)
     print(
         "Honesty note: every line has identical odds of winning; these are optimised only "
         "to share less when they win and to spread the set. Long-run cost is unchanged."
@@ -206,17 +267,22 @@ def run_play(args: argparse.Namespace) -> None:
 
 def run_ev_table(args: argparse.Namespace) -> None:
     ev_model = build_ev_model(args)
-    print("=== EV per ticket vs jackpot (sales held fixed) ===")
-    print(f"Sales: {ev_model.sales:,.0f} tickets ({ev_model.sales_source}); ticket price EUR {TICKET_COST:.2f}.")
+    print("=== EV per ticket vs jackpot (sales follow the jackpot unless --sales given) ===")
+    print(f"Sales source: {ev_model.sales_source}; ticket price EUR {TICKET_COST:.2f}.")
     for row in ev_model.jackpot_sweep():
-        marker = " <- cap" if row["jackpot"] >= JACKPOT_CAP else ""
+        if row["must_be_won"]:
+            marker = " <- MUST-BE-WON (jackpot rolls down if unwon)"
+        elif row["jackpot"] >= JACKPOT_CAP:
+            marker = " <- cap"
+        else:
+            marker = ""
         print(
-            f"  Jackpot EUR {row['jackpot']:>13,.0f}: neutral-ticket EV EUR {row['neutral_ev']:.4f} "
-            f"({row['neutral_ev_per_euro']:.3f} per euro){marker}"
+            f"  Jackpot EUR {row['jackpot']:>13,.0f} (sales {row['sales'] / 1e6:5.1f}M): "
+            f"EV EUR {row['neutral_ev']:.4f} ({row['neutral_ev_per_euro']:.3f} per euro){marker}"
         )
     print(
-        "Reading: EV varies severalfold with the jackpot but stays below the ticket price -- "
-        "'when to play' dominates 'what to pick'."
+        "Reading: 'when to play' dominates 'what to pick'. Ordinary draws never reach the "
+        "EUR 2.50 price; the capped must-be-won draw is the one rule-created exception."
     )
 
 

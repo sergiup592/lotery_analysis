@@ -80,13 +80,27 @@ TIER_ALLOCATION: Dict[Tuple[int, int], float] = {
 
 CPF_PER_TICKET = 1.10          # EUR paid into the Common Prize Fund per line
 BASE_JACKPOT = 17_000_000.0    # guaranteed minimum jackpot
-JACKPOT_CAP = 250_000_000.0    # current cap (held for max 4 draws, then must be won)
+JACKPOT_CAP = 250_000_000.0    # current cap (cycle of 5 draws, then must be won)
 FALLBACK_SALES = 25_000_000.0  # used when no winner-count archive is available
 
 # Rule note: from the 6th consecutive rollover the jackpot allocation drops from
 # 50% to 42% (difference to reserve). This shifts how the *advertised* jackpot
 # accumulates between draws; given an advertised J it does not change this
 # draw's EV, so it is deliberately not a model parameter.
+
+# --- Sales elasticity (calibrated on this repo's own winner-count archive) ------
+#
+# Implied Europe-wide sales across 1,013 draws (2016-2026): ~16-20M tickets on
+# base draws, 23.6M median, and 59-67M on the cap-level mega-jackpot draws.
+# A linear response calibrated on those anchors keeps high-jackpot EV honest:
+# assuming median sales at a EUR 250M jackpot would overstate EV by ~2.5x.
+SALES_AT_BASE_JACKPOT = 18_000_000.0
+SALES_PER_JACKPOT_EURO = 0.19  # extra tickets sold per EUR of advertised jackpot
+
+
+def sales_for_jackpot(jackpot: float) -> float:
+    """Expected Europe-wide ticket sales for an advertised jackpot."""
+    return SALES_AT_BASE_JACKPOT + SALES_PER_JACKPOT_EURO * max(0.0, float(jackpot) - BASE_JACKPOT)
 
 _TOTAL_COMBOS_MAIN = comb(MAIN_NUMBER_RANGE, N_MAIN)
 _TOTAL_COMBOS_BONUS = comb(BONUS_NUMBER_RANGE, N_BONUS)
@@ -189,7 +203,10 @@ def estimate_recent_sales(n_recent: int = 100) -> Optional[float]:
 @dataclass(frozen=True)
 class EVConfig:
     jackpot: float = BASE_JACKPOT
-    sales: Optional[float] = None          # None -> estimate from winner counts
+    sales: Optional[float] = None          # None -> jackpot-elasticity model
+    must_be_won: bool = False              # capped 5th draw: jackpot rolls down if unwon
+    raffle_prize: float = 0.0              # country raffle (My Million, Millionaire Maker)
+    raffle_pool: float = 0.0               # tickets competing for that raffle
     ticket_price: float = TICKET_COST
     cpf_per_ticket: float = CPF_PER_TICKET
 
@@ -200,6 +217,9 @@ class EVConfig:
         return cls(
             jackpot=max(0.0, float(payload.get("jackpot", BASE_JACKPOT))),
             sales=None if sales in (None, 0, "0", 0.0) else float(sales),
+            must_be_won=bool(payload.get("must_be_won", False)),
+            raffle_prize=max(0.0, float(payload.get("raffle_prize", 0.0))),
+            raffle_pool=max(0.0, float(payload.get("raffle_pool", 0.0))),
             ticket_price=float(payload.get("ticket_price", TICKET_COST)),
             cpf_per_ticket=float(payload.get("cpf_per_ticket", CPF_PER_TICKET)),
         )
@@ -208,6 +228,9 @@ class EVConfig:
         return {
             "jackpot": self.jackpot,
             "sales": self.sales,
+            "must_be_won": self.must_be_won,
+            "raffle_prize": self.raffle_prize,
+            "raffle_pool": self.raffle_pool,
             "ticket_price": self.ticket_price,
             "cpf_per_ticket": self.cpf_per_ticket,
         }
@@ -239,9 +262,11 @@ class EVModel:
             self.sales = float(self.config.sales)
             self.sales_source = "explicit"
         else:
-            implied = estimate_recent_sales()
-            self.sales = implied if implied else FALLBACK_SALES
-            self.sales_source = "implied from winner counts" if implied else "fallback constant"
+            # Sales respond strongly to the advertised jackpot (16-20M base ->
+            # 59-67M at cap in this repo's own archive); pricing high jackpots
+            # at median sales would overstate EV, so model the response.
+            self.sales = sales_for_jackpot(self.config.jackpot)
+            self.sales_source = "jackpot-elasticity model"
         if self.sales <= 0:
             raise ValueError("Ticket sales must be positive.")
 
@@ -298,6 +323,35 @@ class EVModel:
             return float(self.config.jackpot)
         return TIER_ALLOCATION[(k, s)] * self.config.cpf_per_ticket * self.sales
 
+    def _rolldown_ev(self, our_lambdas: Dict[Tuple[int, int], float]) -> float:
+        """
+        Must-be-won draws (5th draw at the jackpot cap): if no ticket matches
+        5+2, the jackpot is paid to the next prize tier that has winners --
+        this has happened (17 Nov 2006: EUR 183M shared by twenty 5+1 winners).
+        Our expected euros from that redistribution, walking the official
+        prize-rank chain: win tier r AND all higher tiers empty AND share J.
+        """
+        jackpot = float(self.config.jackpot)
+        chain = list(TIER_ALLOCATION)  # official prize-rank order
+        ev = 0.0
+        cumulative_higher = 0.0  # expected winners across all tiers above rank r
+        for index in range(1, len(chain)):
+            cumulative_higher += self.sales * tier_probability(*chain[index - 1])
+            p_higher_empty = exp(-cumulative_higher)
+            if p_higher_empty < 1e-12:
+                break
+            tier = chain[index]
+            ev += tier_probability(*tier) * p_higher_empty * jackpot * poisson_share(our_lambdas[tier])
+        return ev
+
+    def _raffle_ev(self) -> float:
+        """Country raffles (FDJ My Million, UK Millionaire Maker, ...): a
+        guaranteed prize among that country's tickets. Flat EV per ticket;
+        better on low-sales (Tuesday) draws."""
+        if self.config.raffle_prize > 0 and self.config.raffle_pool > 0:
+            return float(self.config.raffle_prize) / float(self.config.raffle_pool)
+        return 0.0
+
     def ticket_ev(self, mains: Sequence[int], stars: Sequence[int], detailed: bool = False) -> Dict[str, Any]:
         mains = [int(value) for value in mains]
         stars = [int(value) for value in stars]
@@ -306,10 +360,12 @@ class EVModel:
         ev_jackpot = 0.0
         tiers: List[Dict[str, float]] = []
         lambda_jackpot = 0.0
+        our_lambdas: Dict[Tuple[int, int], float] = {}
 
         for (k, s) in TIER_ALLOCATION:
             q = tier_probability(k, s)
             lam = self.cowinner_intensity(mains, stars, k, s)
+            our_lambdas[(k, s)] = lam
             payout = self._tier_fund(k, s) * poisson_share(lam)
             contribution = q * payout
             ev_total += contribution
@@ -327,11 +383,17 @@ class EVModel:
                     }
                 )
 
+        ev_rolldown = self._rolldown_ev(our_lambdas) if self.config.must_be_won else 0.0
+        ev_raffle = self._raffle_ev()
+        ev_total += ev_rolldown + ev_raffle
+
         result: Dict[str, Any] = {
             "ev_eur": float(ev_total),
             "ev_per_euro": float(ev_total / self.config.ticket_price),
             "ev_jackpot_component": float(ev_jackpot),
-            "ev_lower_tiers": float(ev_total - ev_jackpot),
+            "ev_rolldown_component": float(ev_rolldown),
+            "ev_raffle_component": float(ev_raffle),
+            "ev_lower_tiers": float(ev_total - ev_jackpot - ev_rolldown - ev_raffle),
             "expected_jackpot_cowinners": float(lambda_jackpot),
             "jackpot_crowding": float(
                 lambda_jackpot / (self.sales / (_TOTAL_COMBOS_MAIN * _TOTAL_COMBOS_BONUS))
@@ -346,17 +408,22 @@ class EVModel:
         the fair baseline every real ticket is compared against."""
         ev_total = 0.0
         ev_jackpot = 0.0
+        neutral_lambdas: Dict[Tuple[int, int], float] = {}
         for (k, s) in TIER_ALLOCATION:
             q = tier_probability(k, s)
             lam = self.sales * q
+            neutral_lambdas[(k, s)] = lam
             contribution = q * self._tier_fund(k, s) * poisson_share(lam)
             ev_total += contribution
             if (k, s) == (N_MAIN, N_BONUS):
                 ev_jackpot = contribution
+        ev_rolldown = self._rolldown_ev(neutral_lambdas) if self.config.must_be_won else 0.0
+        ev_total += ev_rolldown + self._raffle_ev()
         return {
             "ev_eur": float(ev_total),
             "ev_per_euro": float(ev_total / self.config.ticket_price),
             "ev_jackpot_component": float(ev_jackpot),
+            "ev_rolldown_component": float(ev_rolldown),
         }
 
     def attach(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -424,24 +491,29 @@ class EVModel:
         self,
         jackpots: Sequence[float] = (BASE_JACKPOT, 50e6, 100e6, 150e6, 200e6, JACKPOT_CAP),
         ticket: Optional[Tuple[Sequence[int], Sequence[int]]] = None,
+        include_must_be_won: bool = True,
     ) -> List[Dict[str, Any]]:
         """
-        EV per EUR across jackpot levels: the only decision with a large EV
-        range is *when* to play, not which numbers to pick. Sales are held
-        fixed at the configured level; real sales rise with big jackpots, which
-        pushes jackpot-tier sharing up, so treat high-J rows as upper bounds.
+        EV per EUR across jackpot levels -- the decision with the largest EV
+        range in the game. Sales follow the jackpot-elasticity model per row
+        (or stay fixed when explicitly configured). The final row prices the
+        capped MUST-BE-WON draw, where the jackpot rolls down if unwon.
         """
+        explicit_sales = self.config.sales if self.config.sales else None
         rows: List[Dict[str, Any]] = []
-        for jackpot in jackpots:
-            # Pass the already-resolved sales figure: keeps every row consistent
-            # and avoids re-reading the winner-counts cache per jackpot level.
+        sweep = [(float(j), False) for j in jackpots]
+        if include_must_be_won:
+            sweep.append((float(JACKPOT_CAP), True))
+        for jackpot, must_be_won in sweep:
             model = EVModel(
-                replace(self.config, jackpot=float(jackpot), sales=self.sales),
+                replace(self.config, jackpot=jackpot, sales=explicit_sales, must_be_won=must_be_won),
                 main_weights=self.main_weights,
                 bonus_weights=self.bonus_weights,
             )
             row: Dict[str, Any] = {
-                "jackpot": float(jackpot),
+                "jackpot": jackpot,
+                "must_be_won": must_be_won,
+                "sales": round(model.sales, 0),
                 "neutral_ev": round(model.neutral_ev()["ev_eur"], 4),
             }
             if ticket is not None:

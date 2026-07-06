@@ -92,6 +92,67 @@ class EVModelTests(unittest.TestCase):
         rows = _test_model().jackpot_sweep(jackpots=(17e6, 100e6, 250e6))
         values = [row["neutral_ev"] for row in rows]
         self.assertEqual(values, sorted(values))
+        self.assertTrue(rows[-1]["must_be_won"])  # final row prices the must-be-won draw
+
+
+class MustBeWonTests(unittest.TestCase):
+    def _model(self, must_be_won: bool, sales: float = 62e6) -> EVModel:
+        main = np.where(np.arange(1, MAIN_NUMBER_RANGE + 1) <= 25, 1.3, 0.7)
+        bonus = np.where(np.arange(1, BONUS_NUMBER_RANGE + 1) <= 6, 1.25, 0.75)
+        return EVModel(
+            EVConfig(jackpot=250e6, sales=sales, must_be_won=must_be_won),
+            main_weights=main,
+            bonus_weights=bonus,
+        )
+
+    def test_must_be_won_beats_ordinary_draw_at_same_parameters(self):
+        ordinary = self._model(False).neutral_ev()["ev_eur"]
+        must_be_won = self._model(True).neutral_ev()["ev_eur"]
+        self.assertGreater(must_be_won, ordinary + 1.0)
+
+    def test_must_be_won_neutral_ev_exceeds_ticket_price_at_observed_cap_sales(self):
+        # The headline result: at historically observed cap-draw sales (~62M),
+        # the must-be-won draw is EV-positive -- the only such draw type.
+        result = self._model(True).neutral_ev()
+        self.assertGreater(result["ev_eur"], 2.50)
+        self.assertGreater(result["ev_rolldown_component"], 1.0)
+
+    def test_rolldown_premium_vanishes_at_huge_sales(self):
+        # With enormous sales someone almost surely hits 5+2, so the rolldown
+        # is nearly worthless and must-be-won converges to the ordinary draw.
+        ordinary = self._model(False, sales=5e9).neutral_ev()["ev_eur"]
+        must_be_won = self._model(True, sales=5e9).neutral_ev()["ev_eur"]
+        self.assertLess(must_be_won - ordinary, 0.01 * ordinary)
+
+    def test_unpopular_ticket_amplifies_rolldown_value(self):
+        model = self._model(True)
+        unpopular = model.ticket_ev([32, 38, 43, 46, 49], [10, 11])
+        popular = model.ticket_ev([3, 7, 11, 13, 17], [3, 5])
+        self.assertGreater(unpopular["ev_rolldown_component"], popular["ev_rolldown_component"] * 1.5)
+
+
+class SalesAndRaffleTests(unittest.TestCase):
+    def test_sales_elasticity_is_anchored_and_monotone(self):
+        from src.ev import BASE_JACKPOT, JACKPOT_CAP, sales_for_jackpot
+
+        self.assertAlmostEqual(sales_for_jackpot(BASE_JACKPOT), 18e6)
+        self.assertGreater(sales_for_jackpot(100e6), sales_for_jackpot(50e6))
+        self.assertAlmostEqual(sales_for_jackpot(JACKPOT_CAP), 62.27e6, delta=0.5e6)
+
+    def test_explicit_sales_override_elasticity(self):
+        model = EVModel(EVConfig(jackpot=250e6, sales=30e6))
+        self.assertEqual(model.sales, 30e6)
+        self.assertEqual(model.sales_source, "explicit")
+
+    def test_raffle_adds_flat_ev(self):
+        base = _test_model()
+        with_raffle = EVModel(
+            EVConfig(jackpot=17e6, sales=25e6, raffle_prize=1_000_000, raffle_pool=4_000_000),
+            main_weights=base.main_weights,
+            bonus_weights=base.bonus_weights,
+        )
+        delta = with_raffle.neutral_ev()["ev_eur"] - base.neutral_ev()["ev_eur"]
+        self.assertAlmostEqual(delta, 0.25, places=9)
 
 
 class EVSelectionTests(unittest.TestCase):
