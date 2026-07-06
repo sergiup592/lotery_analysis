@@ -142,11 +142,3 @@ tests/                   42 tests incl. exactness proofs vs Monte Carlo
 lottery_data/            calibrated inputs (+ drop FDJ ZIPs here to refit)
 predictions/             JSON outputs (gitignored)
 ```
-
-## Honest summary
-
-Playing EuroMillions loses money in expectation, always. If you play
-anyway: play rollover draws not base draws, pick unpopular combinations,
-spread multi-ticket budgets disjointly — and treat the ticket as
-entertainment, not investment. This toolkit makes each of those choices
-optimal and shows its work.
